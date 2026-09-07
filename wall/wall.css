@@ -401,6 +401,11 @@ body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; us
 .detail-nav { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
 .detail-nav .btn { min-width: 40px; height: 40px; font-size: 20px; }
 .detail-nav .pos { color: var(--muted); font-variant-numeric: tabular-nums; }
+.detail .attrs { margin: 12px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; align-items: start; }
+.detail .attrs dt { color: var(--accent-text); font-size: 10px; letter-spacing: 0.13em; text-transform: uppercase; font-weight: 700; padding-top: 4px; }
+.detail .attrs dd { margin: 0; }
+.chip.example { font: inherit; font-size: 11.5px; }
+.chip.example[aria-pressed="true"] { background: rgb(var(--accent-rgb)); border-color: rgb(var(--accent-rgb)); color: var(--accent-on); font-weight: 600; }
 .detail img { width: 100%; border-radius: 6px; display: block; margin-bottom: 12px; }
 .detail h2 { margin: 0 0 6px; font-size: 17px; line-height: 1.3; color: var(--text); }
 .detail .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }

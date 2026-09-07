@@ -805,6 +805,25 @@ function onViewportChange(v) {
   updateRowTitle(stageRect);
 }
 
+/** A facet value as a control: click narrows to items sharing it, Shift-click adds it to the facet's values. */
+function exampleChip(key, value) {
+  const c = document.createElement('button'); c.type = 'button'; c.className = 'chip example';
+  c.dataset.exampleFacet = key; c.dataset.exampleValue = value;
+  c.textContent = value;
+  c.setAttribute('aria-pressed', String(state.active.get(key)?.has(value) || false));
+  c.setAttribute('aria-label', `${state.facetLabels[key] || key}: ${value}. Show items sharing this`);
+  c.addEventListener('click', e => selectFacetValue(key, value, e.shiftKey));
+  return c;
+}
+function selectFacetValue(key, value, add = false) {
+  rememberScope();
+  const current = state.active.get(key);
+  const next = add && current ? new Set(current) : new Set();
+  if (add && current?.has(value)) next.delete(value); else next.add(value);
+  state.active.set(key, next);
+  buildFacetRail(); applyFilters();
+}
+
 /** Narrow the working set to one group of the current grouping (Shift adds it to the current values). */
 function selectGroup(value, add = false) {
   const key = state.groupKey;
@@ -882,7 +901,17 @@ function setShowcase(on) {
   showcase.on = on;
   showcaseButton.setAttribute('aria-pressed', String(on)); showcaseButton.classList.toggle('on', on); showcaseButton.textContent = on ? '⏸' : '▶';
   clearInterval(showcase.timer); showcase.timer = 0;
-  if (on) { flowPlane.hidden = false; showcaseTick(); showcase.timer = setInterval(showcaseTick, showcase.interval); }
+  if (on) {
+    flowPlane.hidden = false;
+    // From an overview no slot is readable: zoom the centre up to ~110px tiles first.
+    if (!state.spatialOn && !showcaseSlots(el.stage.getBoundingClientRect()).length && state.positions.size) {
+      const heights = [...state.positions.values()].map(p => p.h).sort((a, b) => a - b);
+      const median = heights[Math.floor(heights.length / 2)] || 240;
+      const target = 110 / median;
+      if (target > viewport.scale) zoomBy(target / viewport.scale);
+    }
+    showcaseTick(); showcase.timer = setInterval(showcaseTick, showcase.interval);
+  }
   else { for (const card of showcase.cards.values()) card.remove(); showcase.cards.clear(); flowPlane.hidden = true; }
 }
 showcaseButton.addEventListener('click', () => setShowcase(!showcase.on));
@@ -1178,13 +1207,23 @@ function openDetail(clip) {
   if (clip.tags?.length) {
     const chips = document.createElement('div');
     chips.className = 'chips';
-    for (const t of clip.tags) {
-      const c = document.createElement('span');
-      c.className = 'chip';
-      c.textContent = t;
-      chips.append(c);
-    }
+    for (const t of clip.tags) chips.append(exampleChip('tags', t));
     d.append(chips);
+  }
+  // Filter by example: every facet value this item carries is a chip. Click
+  // narrows the working set to items sharing it; Shift-click adds the value.
+  const facetKeys = Object.keys(clip.props || {}).filter(k => !FACET_BLOCKLIST.has(k) && state.facets[k] && Object.keys(state.facets[k]).length > 1);
+  if (facetKeys.length) {
+    const attrs = document.createElement('dl'); attrs.className = 'attrs';
+    for (const key of facetKeys) {
+      const values = [].concat(clip.props[key]).filter(v => v !== '' && v !== null && v !== undefined).map(String);
+      if (!values.length) continue;
+      const dt = document.createElement('dt'); dt.textContent = state.facetLabels[key] || key;
+      const dd = document.createElement('dd'); dd.className = 'chips';
+      for (const v of values) dd.append(exampleChip(key, v));
+      attrs.append(dt, dd);
+    }
+    d.append(attrs);
   }
 
   const actions = document.createElement('div');
