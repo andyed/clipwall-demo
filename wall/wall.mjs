@@ -1009,6 +1009,7 @@ function toggleFacet(key, value, chip) {
   else set.add(value);
   chip.setAttribute('aria-pressed', String(!on));
   applyFilters();
+  closeRailIfNarrow();
 }
 
 function buildGroupOptions() {
@@ -1241,6 +1242,10 @@ function fitWall() {
   else { setBackgroundRevealed(false); render(); viewport.fit(); }
 }
 document.getElementById('zoom-fit').addEventListener('click', fitWall);
+/** Phones: the rail is an overlay that starts closed and closes after a choice. */
+const narrow = () => matchMedia('(max-width: 700px)').matches;
+function closeRailIfNarrow() { if (narrow() && !el.rail.classList.contains('hidden')) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); } }
+if (narrow()) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); }
 document.getElementById('toggle-rail').addEventListener('click', () => {
   el.rail.classList.toggle('hidden');
   el.stage.classList.toggle('full');

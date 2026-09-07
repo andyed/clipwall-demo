@@ -48,6 +48,8 @@ export class Viewport {
     this._edgePhase = '';
     this._frame = 0;
     this._drag = null;
+    this._touches = new Map(); // active touch pointers, for pinch zoom
+    this._pinch = null;        // { dist, mid } of the previous two-finger frame
     this.mirror = null;  // optional (transform, transition) => void for layers that share the camera
     this.settlesAt = 0;  // performance.now() at which the current transition lands
     this._transition = 0; // duration of the transition to apply on the next write
@@ -192,7 +194,19 @@ export class Viewport {
     let view = { x: px - cx * next, y: py - cy * next, scale: next };
     if (this.panMode !== 'free' && this.bounds) view = boundPan(view, { w: r.width, h: r.height }, this.bounds);
     this._transition = reducedMotion() ? 0 : duration;
+    if (!duration) this._cancelZoom(); // a pinch frame must land now, not ease
     this._set(view.x, view.y, view.scale);
+  }
+
+  /** Two touch points: zoom about their midpoint by the change in spread, and pan by the midpoint's motion. */
+  _pinchMove() {
+    const [a, b] = [...this._touches.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y), mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (this._pinch && this._pinch.dist > 0) {
+      this.zoomAt(mid.x, mid.y, dist / this._pinch.dist, { duration: 0 });
+      this._pan(mid.x - this._pinch.mid.x, mid.y - this._pinch.mid.y);
+    }
+    this._pinch = { dist, mid };
   }
 
   /** Ease the camera to a new position at the current scale (a "scroll to"). */
@@ -264,6 +278,17 @@ export class Viewport {
       // tile click would be swallowed by the stage and nothing would ever
       // open. Capture is taken lazily in pointermove, once the gesture has
       // proven itself a drag.
+      if (e.pointerType === 'touch') {
+        this._touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (this._touches.size === 2) {
+          // A second finger turns the drag into a pinch; the tap/drag state is abandoned.
+          this.resetEdge(); this._drag = null; this._pinch = null; this.lastDragDistance = 99;
+          try { this.stage.setPointerCapture(e.pointerId); } catch {}
+          this._pinchMove();
+          return;
+        }
+        if (this._touches.size > 2) return;
+      }
       this.resetEdge();
       this._gestureStart = this.snapshot();
       this._drag = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: 0, captured: false };
@@ -271,6 +296,10 @@ export class Viewport {
 
     this.stage.addEventListener('pointermove', (e) => {
       if (!this.enabled) return;
+      if (e.pointerType === 'touch' && this._touches.has(e.pointerId)) {
+        this._touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (this._touches.size >= 2) { this._pinchMove(); return; }
+      }
       if (!this._drag || this._drag.id !== e.pointerId) return;
       const dx = e.clientX - this._drag.x;
       const dy = e.clientY - this._drag.y;
@@ -289,6 +318,11 @@ export class Viewport {
     });
 
     const end = (e) => {
+      if (e.pointerType === 'touch' && this._touches.has(e.pointerId)) {
+        this._touches.delete(e.pointerId);
+        if (this._touches.size < 2) this._pinch = null;
+        if (this.stage.hasPointerCapture?.(e.pointerId)) this.stage.releasePointerCapture(e.pointerId);
+      }
       if (!this._drag || this._drag.id !== e.pointerId) return;
       // Report drag distance so a click handler can tell a tap from a pan.
       this.lastDragDistance = this._drag.moved;

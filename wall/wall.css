@@ -571,3 +571,21 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
   .review-controls #sort-direction { font-size: 12px; padding: 0 6px; }
   .review-controls #attribute-lens { margin-right: 95px; }
 }
+
+/* ---------- narrow screens (phones) ----------
+ * The wall gets the whole width; the filter rail becomes an overlay opened by
+ * the ☰ button and closes after a choice; hover-only controls (attribute
+ * brushing, pan-behaviour experiment) and the keyboard hint are dropped. */
+@media (max-width: 700px) {
+  .review-controls, .pan-behavior, .hint, .bar label[for="group"] { display: none; }
+  .main-controls { padding: 6px 8px; gap: 6px; }
+  .main-controls .brand { width: auto; font-size: 10px; padding-right: 2px; }
+  .main-controls .search { flex: 1 1 120px; min-width: 100px; }
+  .main-controls #group { flex: 1 1 110px; min-width: 100px; }
+  .main-controls .count { margin-left: auto; font-size: 12px; }
+  .stage, .stage.full { left: 0; }
+  .scope-bar, body:has(.stage.full) .scope-bar { left: 0; }
+  .rail { top: var(--bar-h); left: 0; width: min(340px, 88vw); z-index: 18; box-shadow: 12px 0 32px rgba(0, 0, 0, 0.55); }
+  .row-title { top: 8px; height: 34px; }
+  .row-title button { font-size: 14px; padding: 0 10px; }
+}
