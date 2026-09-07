@@ -1243,7 +1243,7 @@ function fitWall() {
 }
 document.getElementById('zoom-fit').addEventListener('click', fitWall);
 /** Phones: the rail is an overlay that starts closed and closes after a choice. */
-const narrow = () => matchMedia('(max-width: 700px)').matches;
+const narrow = () => matchMedia('(max-width: 700px) and (hover: none)').matches; // phones, not narrow desktop windows
 function closeRailIfNarrow() { if (narrow() && !el.rail.classList.contains('hidden')) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); } }
 if (narrow()) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); }
 document.getElementById('toggle-rail').addEventListener('click', () => {
