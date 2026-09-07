@@ -56,6 +56,7 @@ export async function viewDigest(v) {
 /** URL updates share one serialized pipeline. Inline fallback is immediately
  * current; reference URLs are advertised only after durable server readback. */
 export function createPermalinks({ capture, restore, notice, onHistory }) {
+  let snapshotsAbsent = false; // the snapshot endpoint answered 404/405: static hosting
   let ready = false, blocked = false, restoring = false, last = '', lastSemantic = '', generation = 0;
   let pointerActive = false;
   window.addEventListener('pointerdown', () => { pointerActive = true; }, true);
@@ -94,10 +95,13 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
     }
     onHistory();
     if (encoded.length <= 6000 || cache.has(text)) { notice(''); return; }
+    // A static host has no snapshot service: the inline link is the link. Stay quiet after the first 404/405.
+    if (snapshotsAbsent && !inlineFailed) { notice(''); return; }
     notice(inlineFailed ? 'Saving large view… the address bar is not current yet.' : 'Saving compact link… full view is already in the address bar.');
     pending = (async () => {
       try {
         const res = await fetch('/api/permalinks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: text });
+        if ((res.status === 404 || res.status === 405) && !inlineFailed) { snapshotsAbsent = true; if (generation === stamp) notice(''); return; }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { id } = await res.json();
         if (id !== await viewDigest(v)) throw new Error('snapshot identifier mismatch');
