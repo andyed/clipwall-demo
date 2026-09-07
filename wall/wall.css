@@ -315,7 +315,7 @@ html, body {
 .flow-card .cap { z-index: 2; }
 .flow-card:hover { border-color: rgb(var(--accent-rgb)); }
 .flow-card.selected { border-color: rgb(var(--accent-rgb)); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.35); }
-#showcase.on { background: rgb(var(--accent-rgb)); color: var(--accent-on); border-color: rgb(var(--accent-rgb)); }
+#showcase.on, #tour.on { background: rgb(var(--accent-rgb)); color: var(--accent-on); border-color: rgb(var(--accent-rgb)); }
 @media (prefers-reduced-motion: reduce) { .flow-card img { transition: none; } }
 
 /* ---------- group blocks ---------- */

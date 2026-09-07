@@ -231,15 +231,30 @@ export class Viewport {
     return Math.min(24, Math.min(r.width, r.height) * 0.04);
   }
 
+  /** The view that frames the whole canvas with padding, without applying it. */
+  fitTarget(pad = this.fitPadding()) {
+    const r = this.stage.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    const s = Math.min((r.width - pad * 2) / this.content.w, (r.height - pad * 2) / this.content.h);
+    const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
+    return { x: (r.width - this.content.w * scale) / 2, y: (r.height - this.content.h * scale) / 2, scale };
+  }
+
   /** Frame the whole canvas with padding. */
   fit(pad = this.fitPadding()) {
     this.resetEdge(); this._cancelZoom();
-    const r = this.stage.getBoundingClientRect();
-    if (!r.width || !r.height) return;
-    const s = Math.min((r.width - pad * 2) / this.content.w, (r.height - pad * 2) / this.content.h);
-    const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
-    this._set((r.width - this.content.w * scale) / 2, (r.height - this.content.h * scale) / 2, scale);
+    const view = this.fitTarget(pad);
+    if (!view) return;
+    this._set(view.x, view.y, view.scale);
     this.fitted = true;
+  }
+
+  /** Ease to an arbitrary camera (translate and scale interpolate together, so an anchored zoom stays anchored). */
+  animateTo(x, y, scale, { duration = ZOOM_MS.button } = {}) {
+    this.resetEdge();
+    this._transition = reducedMotion() ? 0 : duration;
+    if (!duration) this._cancelZoom();
+    this._set(x, y, scale);
   }
 
   /** Centre a canvas-space rect, optionally choosing a scale to frame it. */

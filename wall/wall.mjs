@@ -590,6 +590,7 @@ function render() {
   el.canvas.style.height = `${result.height}px`;
 
   state.blocks = result.blocks;
+  if (tour.on) setTour(false); // a new layout ends the flythrough; the user is steering
   // Review order for Dive traversal: the laid-out order, one entry per clip.
   { const seen = new Set(); state.order = []; for (const t of result.tiles) if (!seen.has(t.clip.id)) { seen.add(t.clip.id); state.order.push(t.clip); } }
   renderBlocks(result.blocks);
@@ -915,6 +916,57 @@ function setShowcase(on) {
   else { for (const card of showcase.cards.values()) card.remove(); showcase.cards.clear(); flowPlane.hidden = true; }
 }
 showcaseButton.addEventListener('click', () => setShowcase(!showcase.on));
+
+/* ----------------------------------------------------------------- tour --- */
+
+/**
+ * Tour: a guided flythrough of the current layout. From Fit, the camera eases
+ * into each group at a readable scale, sweeps across it, returns to Fit, and
+ * moves on, looping until any input (pointer, wheel, key, filter) takes control
+ * back. It only moves the camera: scope, layout and identities are untouched.
+ */
+const tourButton = document.getElementById('tour');
+const tour = { on: false, timer: 0, plan: [], step: 0 };
+function tourPlan() {
+  const r = el.stage.getBoundingClientRect();
+  const heights = [...state.positions.values()].map(p => p.h).sort((a, b) => a - b);
+  const median = heights[Math.floor(heights.length / 2)] || 240;
+  const blocks = state.blocks?.length ? state.blocks : [{ x: 0, y: 0, w: viewport.content.w, h: viewport.content.h, tileH: median }];
+  const plan = [{ kind: 'fit', duration: 1200, hold: 1400 }];
+  for (const b of blocks) {
+    // Enter at whichever is larger: tiles readable (~110px) or the block framed; capped so tiny groups do not balloon.
+    const blockFit = Math.min(r.width / (b.w + 48), r.height / (b.h + 48));
+    const s = Math.min(2, Math.max(110 / (b.tileH || median), blockFit));
+    const winW = r.width / s, winH = r.height / s;
+    const x0 = 12 - b.x * s, y0 = 12 - b.y * s; // the group's heading in the top-left corner
+    plan.push({ kind: 'view', x: x0, y: y0, scale: s, duration: 1500, hold: 900 });
+    const dx = Math.max(0, b.w - winW), dy = Math.max(0, b.h - winH);
+    if (dx > 20 || dy > 20) {
+      const dist = Math.hypot(dx, dy) * s; // screen px travelled
+      plan.push({ kind: 'view', x: x0 - dx * s, y: y0 - dy * s, scale: s, duration: Math.min(9000, Math.max(2500, dist * 4)), hold: 700 });
+    }
+    plan.push({ kind: 'fit', duration: 1200, hold: 1200 });
+  }
+  return plan;
+}
+function tourStep() {
+  if (!tour.on || state.spatialOn) return;
+  if (tour.step >= tour.plan.length) { tour.plan = tourPlan(); tour.step = 0; }
+  const step = tour.plan[tour.step++];
+  if (step.kind === 'fit') { const v = viewport.fitTarget(); if (v) { viewport.animateTo(v.x, v.y, v.scale, { duration: step.duration }); viewport.fitted = true; } }
+  else viewport.animateTo(step.x, step.y, step.scale, { duration: step.duration });
+  tour.timer = setTimeout(tourStep, step.duration + step.hold);
+}
+function setTour(on) {
+  tour.on = on;
+  tourButton.setAttribute('aria-pressed', String(on)); tourButton.classList.toggle('on', on);
+  clearTimeout(tour.timer); tour.timer = 0;
+  if (on) { tour.plan = tourPlan(); tour.step = 0; tourStep(); }
+}
+tourButton.addEventListener('click', () => setTour(!tour.on));
+// Any input takes control back.
+for (const type of ['pointerdown', 'wheel']) el.stage.addEventListener(type, () => { if (tour.on) setTour(false); }, { passive: true, capture: true });
+for (const id of ['zoom-in', 'zoom-out', 'zoom-fit']) document.getElementById(id).addEventListener('click', () => { if (tour.on) setTour(false); }, { capture: true });
 
 /* ------------------------------------------------------------ row title --- */
 
@@ -1425,6 +1477,8 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === '-') zoomBy(1 / 1.3);
   else if (e.key === ']') stepGroup(1);
   else if (e.key === 'p') setShowcase(!showcase.on);
+  else if (e.key === 't') setTour(!tour.on);
+  else if (tour.on) setTour(false);
   else if (e.key === '[') stepGroup(-1);
 });
 
