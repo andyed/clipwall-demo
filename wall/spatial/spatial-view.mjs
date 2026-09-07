@@ -69,7 +69,10 @@ export const keyOfClip = (clip) => clip.url || `id:${clip.id}`;
  * Vault media is already same-origin and is left alone.
  */
 function proxied(src) {
-  if (src.startsWith('/')) return src;
+  // Same-origin media needs no proxy: root-relative (the server) or relative
+  // (the static demo, served from a sub-path). Only absolute remote URLs go through it.
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith('//')) return src;
+  if (new URL(src, location.href).origin === location.origin) return src;
   return `/api/proxy?url=${encodeURIComponent(src)}`;
 }
 

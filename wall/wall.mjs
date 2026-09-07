@@ -491,7 +491,8 @@ async function toggleSpatial(on) {
   if (on && !state.spatial) {
     state.spatialLoading = true;
     try {
-      const { SpatialView, keyOfClip } = await import('./spatial/spatial-view.mjs') // module-relative: the demo is served from a sub-path;
+      // Module-relative: the static demo is served from a sub-path, where /wall/… would 404.
+      const { SpatialView, keyOfClip } = await import('./spatial/spatial-view.mjs');
       state.clipKey = keyOfClip;
       state.spatial = new SpatialView(el.spHost, { onOpen: openDetail });
       await loadViewState();
