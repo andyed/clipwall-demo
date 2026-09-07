@@ -60,9 +60,10 @@
   <div class="bg-plane" id="bg-plane" hidden></div>
   <div class="canvas" id="canvas"></div>
   <div class="sp-host" id="sp-host" hidden></div>
-  <button class="row-title" id="row-title" type="button" hidden title="Next group (click) · previous (Shift-click) · ] and [ keys">
-    <strong></strong><span class="n"></span><span class="pos"></span><span class="next" aria-hidden="true">›</span>
-  </button>
+  <div class="row-title" id="row-title" hidden>
+    <button class="rt-focus" type="button" title="Show only this group"><strong></strong><span class="n"></span><span class="pos"></span></button>
+    <button class="rt-next" type="button" title="Next group (Shift-click: previous) · ] and [ keys" aria-label="Next group">›</button>
+  </div>
 </main>
 
 <aside class="detail" id="detail" aria-label="Clip detail"></aside>

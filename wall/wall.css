@@ -334,6 +334,9 @@ html, body {
   letter-spacing: 0.01em;
 }
 .block.tight h2 { display: none; } /* too narrow on screen to fit a label: covers only */
+.block h2[role="button"] { pointer-events: auto; cursor: pointer; }
+.block h2[role="button"]:hover { background: rgba(5, 5, 16, 0.98); text-decoration: underline; text-decoration-color: rgba(var(--accent-rgb), 0.6); }
+.block h2[role="button"]:focus-visible { outline: calc(2 * var(--group-label-unit, 1px)) solid var(--accent-text); }
 .block h2 span {
   color: var(--muted);
   font-weight: 500;
@@ -496,12 +499,16 @@ body.has-scope { --scope-h: 60px; }
  * screen-space title names the group under the viewport. It drifts at a third
  * of pan speed (parallax), is pushed off by the next group's edge like a sticky
  * header, and steps between groups on click. Never part of layout or scope. */
-.row-title { position: absolute; top: 10px; left: 0; height: 36px; z-index: 6; display: inline-flex; align-items: center; gap: 10px; padding: 0 12px 0 14px; background: var(--scrim); border: 1px solid rgba(var(--accent-rgb), 0.35); border-radius: 6px; color: var(--accent-text); font: 700 15px/1 inherit; font-family: inherit; letter-spacing: 0.01em; cursor: pointer; white-space: nowrap; transition: transform 0.18s ease; }
+.row-title { position: absolute; top: 10px; left: 0; height: 36px; z-index: 6; display: inline-flex; align-items: stretch; background: var(--scrim); border: 1px solid rgba(var(--accent-rgb), 0.35); border-radius: 6px; color: var(--accent-text); white-space: nowrap; transition: transform 0.18s ease; }
 .row-title[hidden] { display: none; }
+.row-title[data-layer="context"] { border-style: dashed; } /* naming a group on the context plane */
+.row-title button { background: transparent; border: 0; color: inherit; font: 700 15px/1 inherit; font-family: inherit; letter-spacing: 0.01em; cursor: pointer; display: inline-flex; align-items: center; gap: 10px; padding: 0 12px; }
+.row-title .rt-focus { padding-left: 14px; }
+.row-title .rt-next { font-size: 20px; border-left: 1px solid rgba(var(--accent-rgb), 0.25); }
 .row-title .n, .row-title .pos { color: var(--muted); font-weight: 500; font-size: 13px; font-variant-numeric: tabular-nums; }
-.row-title .next { color: var(--accent-text); font-size: 20px; line-height: 1; margin-left: 2px; }
-.row-title:hover { background: rgba(5, 5, 16, 0.98); border-color: rgb(var(--accent-rgb)); }
-.row-title:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; }
+.row-title button:hover { background: rgba(var(--accent-rgb), 0.12); }
+.row-title .rt-focus:hover strong { text-decoration: underline; text-decoration-color: rgba(var(--accent-rgb), 0.6); }
+.row-title button:focus-visible { outline: 2px solid var(--accent-text); outline-offset: -2px; }
 @media (prefers-reduced-motion: reduce) { .row-title { transition: none; } }
 .scope-bar, .context-clusters { position: fixed; left: 216px; right: 0; background: var(--panel); z-index: 14; font-size: 16px; font-weight: 500; }
 .scope-bar { top: var(--bar-h); height: var(--scope-h); display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); }

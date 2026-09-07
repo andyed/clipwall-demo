@@ -372,7 +372,12 @@ function backgroundDepth() {
 function planeScale(stage) {
   const b = state.background.framed?.bounds;
   if (!b || !b.w || !b.h) return 1;
-  return Math.min(1, 1.25 * Math.min(stage.w / b.w, stage.h / b.h));
+  const base = Math.min(1, 1.25 * Math.min(stage.w / b.w, stage.h / b.h));
+  // Zoomed into the plane, track the camera: a perspective layer rasterises at
+  // its local size, so text set at 2px local never survives rasterisation
+  // whatever the GPU scales it to. Local units at ~screen resolution keep
+  // headings at their readable size and covers crisp.
+  return Math.min(1, Math.max(base, viewport.scale));
 }
 function mirrorBackground(view, transition) {
   const d = backgroundDepth(), m = state.background.m, st = state.background.stage;
@@ -650,6 +655,14 @@ function buildBlock(b) {
   div.dataset.tileH = String(Math.round(b.tileH || 0));
   const h2 = document.createElement('h2');
   h2.textContent = b.label;                       // untrusted: textContent only
+  // A heading is a control: it narrows the working set to that group. On the
+  // context plane this is the scope pivot; in the foreground it is a group Dive.
+  if (b.label && b.label !== '—') {
+    h2.tabIndex = 0; h2.setAttribute('role', 'button');
+    h2.setAttribute('aria-label', `${b.label}: show only this ${state.facetLabels[state.groupKey] || state.groupKey}, ${b.count} items`);
+    h2.addEventListener('click', e => { if ((viewport.lastDragDistance || 0) > 4) return; selectGroup(b.label, e.shiftKey); });
+    h2.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectGroup(b.label, e.shiftKey); } });
+  }
   const n = document.createElement('span');
   n.textContent = String(b.count);
   h2.append(n);
@@ -774,7 +787,13 @@ function onViewportChange(v) {
     el.stage.style.setProperty('--group-heading-size', `${headingSize / s}px`);
     el.stage.style.setProperty('--group-count-size', `${Math.max(12, headingSize * 0.74) / s}px`);
     el.stage.style.setProperty('--group-label-unit', `${1 / s}px`);
-    if (state.background.mounted) planeLabelSizes(s);
+    if (state.background.mounted) {
+      // Re-layout the plane at a new internal scale once the camera has drifted
+      // a factor of two from it (only while zoomed in past its base scale).
+      const m = state.background.m;
+      if (m < 1 && Math.abs(Math.log2(s / m)) > 1 && Math.max(s, m) > planeScale(state.background.stage) * 0.99 + 1e-9 && s !== m) mountBackground();
+      else planeLabelSizes(s);
+    }
     updateTightBlocks(s);
   }
   if (state.background.mounted) state.background.stage = { w: stageRect.width, h: stageRect.height };
@@ -783,6 +802,18 @@ function onViewportChange(v) {
   updateVisibility({ rect: stageRect, defer: true });
   updateBackgroundVisibility(stageRect);
   updateRowTitle(stageRect);
+}
+
+/** Narrow the working set to one group of the current grouping (Shift adds it to the current values). */
+function selectGroup(value, add = false) {
+  const key = state.groupKey;
+  if (!key || key === 'none') return;
+  rememberScope();
+  const current = state.active.get(key);
+  const next = add && current ? new Set(current) : new Set();
+  next.add(value);
+  state.active.set(key, next);
+  closeDetail(); buildFacetRail(); applyFilters();
 }
 
 /* ------------------------------------------------------------ row title --- */
@@ -796,9 +827,17 @@ function onViewportChange(v) {
  */
 const rowTitle = document.getElementById('row-title');
 let rowTitleLabel = '', rowTitleWidth = 0;
+/** Foreground blocks in screen space, plus the context plane's blocks projected
+ *  by its depth (an approximation along the pivot line; the tilt is ignored). */
 function screenBlocks(stageRect) {
   const s = viewport.scale;
-  return (state.blocks || []).map(b => ({ b, x: b.x * s + viewport.x, y: b.y * s + viewport.y, w: b.w * s, h: b.h * s }));
+  const flat = (state.blocks || []).map(b => ({ b, layer: 'focus', x: b.x * s + viewport.x, y: b.y * s + viewport.y, w: b.w * s, h: b.h * s }));
+  if (!state.background.mounted || !state.background.framed) return flat;
+  const d = backgroundDepth(); if (!d) return flat;
+  const f = BG_PERSPECTIVE / (BG_PERSPECTIVE + d.depth * s), cx = stageRect.width / 2, cy = stageRect.height / 2;
+  const plane = state.background.framed.blocks.map(b => ({ b, layer: 'context',
+    x: cx + (b.x * s + viewport.x - cx) * f, y: cy + (b.y * s + viewport.y - cy) * f, w: b.w * s * f, h: b.h * s * f }));
+  return flat.concat(plane);
 }
 function dominantBlock(stageRect) {
   const W = stageRect.width, H = stageRect.height;
@@ -810,21 +849,28 @@ function dominantBlock(stageRect) {
   return best;
 }
 function updateRowTitle(stageRect) {
-  const best = !state.spatialOn && state.blocks?.length > 1 ? dominantBlock(stageRect) : null;
-  // The pinned title appears only once the block's own heading is cropped off the top.
-  if (!best || best.y + HEADER_H * viewport.scale > 0) { rowTitle.hidden = true; return; }
-  const index = state.blocks.indexOf(best.b), n = state.blocks.length;
-  const label = `${best.b.label || 'Ungrouped'}\u0000${best.b.count}\u0000${index + 1}/${n}`;
+  const grouped = state.groupKey && state.groupKey !== 'none';
+  const best = !state.spatialOn && grouped ? dominantBlock(stageRect) : null;
+  // The pinned title appears once the block's own heading is cropped off the top,
+  // or (on the context plane) its label's left edge is off the stage.
+  const headingOff = best && (best.y + HEADER_H * viewport.scale > 0 ? false : true);
+  const leftOff = best && best.layer === 'context' && best.x < 0;
+  if (!best || !(headingOff || leftOff)) { rowTitle.hidden = true; return; }
+  const list = best.layer === 'context' ? state.background.framed.blocks : state.blocks;
+  const index = list.indexOf(best.b), n = list.length;
+  const label = `${best.layer}\u0000${best.b.label || 'Ungrouped'}\u0000${best.b.count}\u0000${index + 1}/${n}`;
   if (label !== rowTitleLabel) {
     rowTitleLabel = label;
     rowTitle.querySelector('strong').textContent = best.b.label || 'Ungrouped';
     rowTitle.querySelector('.n').textContent = String(best.b.count);
     rowTitle.querySelector('.pos').textContent = `${index + 1} of ${n}`;
-    rowTitle.setAttribute('aria-label', `${best.b.label}, ${best.b.count} items, group ${index + 1} of ${n}. Next group`);
+    rowTitle.querySelector('.rt-focus').setAttribute('aria-label', `${best.b.label}, ${best.b.count} items, group ${index + 1} of ${n}${best.layer === 'context' ? ', on the context plane' : ''}. Show only this group`);
+    rowTitle.dataset.layer = best.layer;
     rowTitle.hidden = false;
     rowTitleWidth = rowTitle.offsetWidth; // measured only when the text changes
   }
   rowTitle.dataset.index = String(index);
+  rowTitle.dataset.label = best.b.label || '';
   // Sticky push-off: the next block's top edge pushes the title up and away.
   let push = 0;
   for (const r of screenBlocks(stageRect)) if (r !== best && r.y > 0 && r.y < 46) push = Math.max(push, 46 - r.y);
@@ -843,7 +889,8 @@ function stepGroup(delta) {
   const x = b.w * s < r.width ? (r.width - b.w * s) / 2 - b.x * s : 12 - b.x * s;
   viewport.panTo(x, 12 - b.y * s, { duration: 420 });
 }
-rowTitle.addEventListener('click', e => stepGroup(e.shiftKey ? -1 : 1));
+rowTitle.querySelector('.rt-next').addEventListener('click', e => stepGroup(e.shiftKey ? -1 : 1));
+rowTitle.querySelector('.rt-focus').addEventListener('click', e => { if (rowTitle.dataset.label) selectGroup(rowTitle.dataset.label, e.shiftKey); });
 
 /**
  * Load images only once they can be seen, and hide the ones that cannot.
