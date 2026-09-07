@@ -7,7 +7,7 @@ library that other consumers are still tracking.
 | | |
 |---|---|
 | upstream | `~/Documents/dev/muriel` — `render_assets/_lib/` |
-| commit | `9c047f5a13a87aab47156d2c1997700e4ba7e4f1` |
+| commit | `5778a5c19ef6a19abeccb9bc8a19d744405f5ef7` |
 | dated | 2026-09-07 |
 | branch | feat/hybrid-tile-field |
 
@@ -24,3 +24,6 @@ why the commit is recorded above and `sync.mjs` checks it.
 node wall/spatial/lib/sync.mjs          # report drift
 node wall/spatial/lib/sync.mjs --pull   # re-copy and update this file
 ```
+
+2026-09-07: pulled upstream contact-sheet pile face (`PileLayout.faceOf`, `faceCount`); the app promotes face members and skips them in its contain pass.
+2026-09-07: pulled square-grid face and empty-pile guard (upstream 5778a5c); the app places each clip in its smallest group, keeps true counts, and a spread pile borrows shared members.

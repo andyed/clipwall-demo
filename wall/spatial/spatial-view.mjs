@@ -180,7 +180,7 @@ export class SpatialView {
         // hidden members. Otherwise late-month covers get stuck at 64px.
         const readable = this.mode === 'piles'
           ? (this.piles.spreadPile >= 0 ? this.piles.piles[this.piles.spreadPile].indices
-            : this.piles.piles.map(p => p.indices.at(-1)).filter(i => i !== undefined)) : [];
+            : this.piles.piles.flatMap((_, i) => this.piles.faceOf(i))) : [];
         for (const i of readable) this.field.atlases.request(i, 'near', now);
         this.field.update(this.camera, now);
         this.hybrid.update(this.camera);
@@ -373,6 +373,7 @@ export class SpatialView {
   }
 
   _spread(index) {
+    { const p = this.piles.piles[index]; if (p?.all) p.indices = p.all; } // a spread shows every member, shared ones included
     const pile = this.piles.piles[index];
     const result = this._composition(pile.indices.map(i => this.clips[i]));
     result.tiles.forEach((t, k) => {
@@ -387,7 +388,8 @@ export class SpatialView {
 
   _packPiles() {
     const covers = this.piles.piles.map((p, i) => ({ id: String(i), props: {
-      dims: [`${Math.round(aspectOfClip(this.clips[p.indices.at(-1)]) * 1000)}x1000`]
+      // A pile placed nothing (every member stands elsewhere) still needs a footprint.
+      dims: [`${Math.round((p.indices.length ? aspectOfClip(this.clips[p.indices.at(-1)]) : 1) * 1000)}x1000`]
     }}));
     const result = this._composition(covers, 90);
     result.tiles.forEach((t, i) => {
@@ -398,11 +400,18 @@ export class SpatialView {
   }
 
   _collapsePile(index) {
-    this.piles.collapse(index, true);
     const pile = this.piles.piles[index];
+    const borrowed = !!pile?.exclusive && pile.indices !== pile.exclusive;
+    if (pile?.exclusive) pile.indices = pile.exclusive; // give shared members back to their own piles
+    this.piles.collapse(index, true);
+    // Shared members the spread borrowed were moved; their owning piles re-place them.
+    if (borrowed) for (let i = 0; i < this.piles.piles.length; i++) if (i !== index) this.piles.collapse(i, true);
     // A stack has a stable cover footprint. Contain banners/portraits within
     // it, retaining proportions; expanding reveals each image at full size.
+    // Face members are already contained in their cells by the layout.
+    const face = new Set(this.piles.faceOf(index));
     for (const i of pile.indices) {
+      if (face.has(i)) continue;
       const w = this.field.sizes[i * 2], h = this.field.sizes[i * 2 + 1];
       const scale = Math.min(pile.w / w, pile.h / h);
       const c = this.field.worldCentre(i, new THREE.Vector3());
@@ -492,14 +501,24 @@ export class SpatialView {
   showPiles(facetKey) {
     // Share date buckets and multi-valued membership with the flat layout.
     const indexOf = new Map(this.clips.map((clip, i) => [clip, i]));
-    const groups = groupBy(this.clips, facetKey).map(({ label, clips }) => ({
-      label, indices: clips.map(clip => indexOf.get(clip))
-    }));
+    // One quad per clip: a clip in several groups (multi-valued facets) can
+    // stand in only one pile. It is placed in the smallest group it belongs
+    // to, so small piles keep their members and large piles lose few; every
+    // pile keeps its true count and full membership, and a spread pile
+    // temporarily borrows its shared members.
+    const raw = groupBy(this.clips, facetKey).map(({ label, clips }) => ({ label, all: clips.map(clip => indexOf.get(clip)) }));
+    const placed = new Set();
+    for (const g of [...raw].sort((a, b) => a.all.length - b.all.length)) {
+      g.indices = g.all.filter(i => !placed.has(i));
+      for (const i of g.indices) placed.add(i);
+    }
+    const groups = raw.map(g => ({ label: g.label, indices: g.indices, all: g.all, count: g.all.length }));
 
     this.mode = 'piles';
     this.hybrid.promoteDistance = Infinity;
     this.hybrid.setFocus(-1);
     this.piles.arrange(groups);
+    this.piles.piles.forEach((p, i) => { p.exclusive = groups[i].indices; p.all = groups[i].all; p.count = groups[i].count; });
     this._generatedPiles = true;
     this._packPiles();
     this.fit();
@@ -533,7 +552,8 @@ export class SpatialView {
   /** One CSS3D label per pile. Nodes only — labels are facet values, which are
    *  scraped strings like any other. */
   _labels() {
-    this._pileTops = new Set(this.piles.piles.map(p => p.indices.at(-1)));
+    // Exposed covers: every member on a pile's contact-sheet face may be promoted to DOM.
+    this._pileTops = new Set(this.piles.piles.flatMap((_, i) => this.piles.faceOf(i)));
     for (const o of this.labelObjs) o.visible = false;
     this.backButton.hidden = this.mode !== 'piles' || this.piles.spreadPile < 0;
     if (!this.backButton.hidden) {
@@ -552,7 +572,7 @@ export class SpatialView {
         this.labelObjs[i] = obj;
       }
       obj.userData.parts.n.textContent = a.label;         // untrusted
-      obj.userData.parts.c.textContent = String(a.count);
+      obj.userData.parts.c.textContent = String(this.piles.piles[i].count ?? a.count);
       const members = this.piles.piles[i].indices;
       let top = -Infinity, front = a.z;
       for (const j of members) {

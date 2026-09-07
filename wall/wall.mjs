@@ -76,6 +76,15 @@ const el = {
 
 const detailPane = createDetailPane(el.detail, el.stage);
 const viewport = new Viewport(el.stage, el.canvas, onViewportChange);
+// The smallest useful scale: Fit of the foreground, or of the foreground plus
+// the context plane when there is one. Below it there is only empty canvas.
+viewport.scaleFloor = () => {
+  const r = el.stage.getBoundingClientRect(), pad = viewport.fitPadding(r);
+  let x = 0, y = 0, right = viewport.content.w, bottom = viewport.content.h;
+  const b = state.background.framed?.bounds;
+  if (b && b.w && b.h && state.filtered.length) { x = Math.min(x, b.x); y = Math.min(y, b.y); right = Math.max(right, b.x + b.w); bottom = Math.max(bottom, b.y + b.h); }
+  return Math.min((r.width - 2 * pad) / Math.max(1, right - x), (r.height - 2 * pad) / Math.max(1, bottom - y));
+};
 let hydrating = false, links;
 const brush = createAttributeBrush({
   canvas: el.canvas, stage: el.stage,

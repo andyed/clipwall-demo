@@ -51,6 +51,7 @@ export class Viewport {
     this._touches = new Map(); // active touch pointers, for pinch zoom
     this._pinch = null;        // { dist, mid } of the previous two-finger frame
     this.mirror = null;  // optional (transform, transition) => void for layers that share the camera
+    this.scaleFloor = null; // optional () => number: the smallest useful scale (Fit of what there is to show)
     this.settlesAt = 0;  // performance.now() at which the current transition lands
     this._transition = 0; // duration of the transition to apply on the next write
     this._bind();
@@ -190,7 +191,9 @@ export class Viewport {
     // rapid ticks compose onto one target and the compositor eases between.
     const cx = (px - this.x) / this.scale;
     const cy = (py - this.y) / this.scale;
-    const next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, this.scale * factor));
+    // Zooming out stops at Fit of what there is to show: a canvas of empty space says nothing.
+    const floor = Math.max(MIN_SCALE, Math.min(this.scale, this.scaleFloor?.() ?? MIN_SCALE));
+    const next = Math.min(MAX_SCALE, Math.max(floor, this.scale * factor));
     let view = { x: px - cx * next, y: py - cy * next, scale: next };
     if (this.panMode !== 'free' && this.bounds) view = boundPan(view, { w: r.width, h: r.height }, this.bounds);
     this._transition = reducedMotion() ? 0 : duration;
