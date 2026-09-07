@@ -497,7 +497,6 @@ body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; us
 body { --scope-h: 0px; }
 body.has-scope { --scope-h: 60px; }
 .stage { top: calc(var(--bar-h) + var(--scope-h)); bottom: 0; }
-.hint { bottom: 10px; }
 
 /* Row title: when zooming in crops a group's heading off the top, a pinned,
  * screen-space title names the group under the viewport. It drifts at a third
@@ -545,17 +544,19 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
 #link-status[hidden] { display: none; }
 
 
-/* Review controls share the existing header and its measured stage boundary. */
+/* One glyph row; the header height is measured into --bar-h. */
 .bar { height: auto; display: block; padding: 0; }
-.main-controls, .review-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 14px; }
-.main-controls { min-height: 56px; }
-.review-controls { border-top: 1px solid var(--border); gap: 10px; }
-.review-controls label { font-size: 13px; letter-spacing: 0; text-transform: none; }
-.review-controls .btn, .review-controls .select { height: 40px; font-size: 14px; }
-.review-controls .select { max-width: 220px; min-width: 120px; }
-.review-tip { color: var(--muted); font-size: 13px; position: relative; flex: 1 1 380px; min-width: 280px; height: 54px; display: flex; align-items: center; }
-.review-tip[data-brush-active] .brush-idle { visibility: hidden; }
-.review-tip .brush-legend { inset: 0; width: 100%; height: 100%; padding: 0 10px; font-size: 13px; box-shadow: none; gap: 0; align-content: center; background: var(--panel); }
+.main-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 14px; min-height: 56px; }
+.main-controls .select { max-width: 200px; min-width: 96px; }
+.main-controls .btn { font-size: 16px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+/* The lens legend is an overlay over the stage, so revealing it never changes
+ * the header height or refits the wall (the reflow-on-hover lesson). */
+.review-tip { position: absolute; top: 8px; right: 12px; width: min(440px, 60%); z-index: 6; pointer-events: none; color: var(--muted); font-size: 13px; display: none; }
+.review-tip[data-brush-active] { display: block; height: 54px; }
+.review-tip .brush-legend { inset: 0; width: 100%; height: 100%; padding: 0 10px; font-size: 13px; box-shadow: none; gap: 0; align-content: center; background: var(--scrim); border: 1px solid var(--border); border-radius: 6px; }
+.edge-undo { position: absolute; left: 12px; bottom: 12px; z-index: 6; height: 40px; min-width: 44px; font-size: 20px; }
+.edge-undo[hidden] { display: none; }
 .review-tip .brush-legend-head strong { flex-shrink: 0; }
 .review-tip .brush-legend-foot { font-size: 12px; gap: 0; }
 .review-tip .brush-scale { gap: 5px; max-height: 36px; overflow: hidden; }
@@ -565,27 +566,17 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
 .review-tip .brush-key { min-width: 0; }
 .review-tip .brush-more { flex-shrink: 0; }
 .review-controls [disabled] { cursor: not-allowed; }
-@media (max-width: 1000px) { .review-tip { flex-basis: 100%; } .main-controls .search { flex-basis: 180px; } }
-@media (max-width: 600px) {
-  .main-controls, .review-controls { gap: 6px; padding: 6px 8px; }
-  .main-controls .brand { width: 100%; }
-  .main-controls .count { margin-left: 0; }
-  .review-controls label { width: 105px; }
-  .review-controls .select { max-width: calc(100vw - 220px); min-width: 90px; flex: 1; }
-  .review-controls #sort-direction { font-size: 12px; padding: 0 6px; }
-  .review-controls #attribute-lens { margin-right: 95px; }
-}
+@media (max-width: 1000px) { .main-controls .search { flex-basis: 160px; } }
 
 /* ---------- narrow screens (phones) ----------
  * The wall gets the whole width; the filter rail becomes an overlay opened by
  * the ☰ button and closes after a choice; hover-only controls (attribute
  * brushing, pan-behaviour experiment) and the keyboard hint are dropped. */
 @media (max-width: 700px) and (hover: none) {
-  .pan-behavior, .hint, .bar label[for="group"] { display: none; }
   .main-controls { padding: 6px 8px; gap: 6px; }
   .main-controls .brand { width: auto; font-size: 10px; padding-right: 2px; }
-  .main-controls .search { flex: 1 1 120px; min-width: 100px; }
-  .main-controls #group { flex: 1 1 110px; min-width: 100px; }
+  .main-controls .search { flex: 1 1 110px; min-width: 90px; }
+  .main-controls #group, .main-controls #sort-key { flex: 1 1 96px; min-width: 90px; }
   .main-controls .count { margin-left: auto; font-size: 12px; }
   .stage, .stage.full { left: 0; }
   .scope-bar, body:has(.stage.full) .scope-bar { left: 0; }
@@ -594,7 +585,7 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
   .row-title button { font-size: 14px; padding: 0 10px; }
 }
 /* Hover-only affordances go with the pointer, not the width: a narrow window on
- * a laptop keeps sort and lens; a phone has no hover to brush with. */
+ * a laptop keeps the lens; a phone has no hover to brush with. */
 @media (max-width: 700px) and (hover: none) {
-  .review-controls { display: none; }
+  #attribute-lens, .review-tip { display: none; }
 }

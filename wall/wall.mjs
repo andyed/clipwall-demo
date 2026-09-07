@@ -286,7 +286,7 @@ function renderContext() {
   host.hidden = true; // Cluster suggestions keep their mechanics; their placement is undecided.
   const list = document.getElementById('context-list'); list.replaceChildren();
   const hint = document.getElementById('context-preview');
-  const instruction = 'Click to switch · Shift-click or Add to combine';
+  const instruction = '';
   hint.textContent = instruction;
   for (const cluster of state.clusters) {
     const card = document.createElement('article'); card.className = 'context-cluster'; card.dataset.cluster = cluster.id;
@@ -509,13 +509,10 @@ async function toggleSpatial(on) {
   viewport.enabled = !on;
   document.getElementById('edge-feedback').hidden = on;
   document.getElementById('pan-behavior').disabled = on;
-  document.getElementById('pan-behavior').title = on
-    ? 'Pan comparison is available in the flat view' : 'Experimental flat-canvas pan behavior';
   state.spatialOn = on;
   brush.setEnabled(!on);
   for (const id of ['sort-key', 'sort-direction', 'attribute-lens']) document.getElementById(id).disabled = on;
   updateSortDirection();
-  document.querySelector('#review-tip .brush-idle').textContent = on ? 'Attribute exploration is available in the flat view' : 'Hover a heading to explore its distribution · hover a value to find matches · click a heading to pin';
   renderContext();
   if (on) setBackgroundRevealed(false);
   el.spHost.hidden = !on;
@@ -719,7 +716,6 @@ function buildTile(clip, { background = false } = {}) {
   node.tabIndex = background ? -1 : 0;
   node.setAttribute('role', 'button');
   node.setAttribute('aria-label', clip.title || 'clip');
-  if (background) node.title = clip.title || '';
 
   const src = clip.cover || clip.media?.[0]?.src || '';
   if (src) {
@@ -993,7 +989,6 @@ function buildFacetRail() {
     if (dropped > 0) {
       const more = document.createElement('button'); more.type = 'button'; more.className = 'chip chip-more';
       more.textContent = `${dropped} more · search`;
-      more.title = `${dropped} rarer ${state.facetLabels[key] || key} values are not listed; type one in the search box`;
       more.addEventListener('click', () => el.search.focus());
       chips.append(more);
     }
@@ -1046,7 +1041,7 @@ function buildReviewControls() {
 function updateSortDirection() {
   const button = document.getElementById('sort-direction');
   const asc = state.sort.direction === 'asc';
-  button.textContent = asc ? '↑ Ascending' : '↓ Descending';
+  button.textContent = asc ? '↑' : '↓';
   button.setAttribute('aria-label', asc ? 'Sort ascending; reverse to descending' : 'Sort descending; reverse to ascending');
   button.disabled = state.spatialOn || state.sort.key === 'none';
 }
@@ -1248,7 +1243,7 @@ const edgeUndo = document.getElementById('edge-undo');
 panBehavior.addEventListener('change', () => {
   viewport.setPanMode(panBehavior.value);
   const url = new URL(location.href);
-  if (panBehavior.value === 'free') url.searchParams.delete('pan');
+  if (panBehavior.value === 'edge') url.searchParams.delete('pan');
   else url.searchParams.set('pan', panBehavior.value);
   history.replaceState(history.state, '', url);
 });
@@ -1329,11 +1324,11 @@ new ResizeObserver(() => {
   else { updateVisibility(); updateBackgroundVisibility(); }
 }).observe(el.stage);
 
+// Edge zoom is the default flat-canvas behaviour; ?pan=free|bounded remain for comparison.
 const initialPan = new URL(location.href).searchParams.get('pan');
-if (['bounded', 'edge'].includes(initialPan)) {
-  panBehavior.value = initialPan;
-  viewport.setPanMode(initialPan);
-}
+const startPan = ['free', 'bounded', 'edge'].includes(initialPan) ? initialPan : 'edge';
+panBehavior.value = startPan;
+viewport.panMode = startPan;
 links = createPermalinks({ capture: captureView, restore: restoreView, notice: linkNotice, onHistory: renderScope });
 document.getElementById('copy-view').addEventListener('click', () => links.copy().catch(err => linkNotice(err.message)));
 document.getElementById('new-view').addEventListener('click', () => { links.newView(); linkNotice(''); });

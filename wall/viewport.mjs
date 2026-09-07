@@ -278,6 +278,8 @@ export class Viewport {
       // tile click would be swallowed by the stage and nothing would ever
       // open. Capture is taken lazily in pointermove, once the gesture has
       // proven itself a drag.
+      // Controls overlaid on the stage (undo, row title) are not gesture starts.
+      if (e.target.closest?.('.edge-undo, .row-title, .review-tip')) return;
       if (e.pointerType === 'touch') {
         this._touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
         if (this._touches.size === 2) {
