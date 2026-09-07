@@ -592,6 +592,8 @@ function render() {
   el.canvas.style.height = `${result.height}px`;
 
   state.blocks = result.blocks;
+  // Review order for Dive traversal: the laid-out order, one entry per clip.
+  { const seen = new Set(); state.order = []; for (const t of result.tiles) if (!seen.has(t.clip.id)) { seen.add(t.clip.id); state.order.push(t.clip); } }
   renderBlocks(result.blocks);
   renderTiles(result.tiles);
   renderBackground(result);
@@ -1080,6 +1082,16 @@ function openDetail(clip) {
   close.addEventListener('click', closeDetail);
   d.append(close);
 
+  // Traverse the review order without leaving Dive: buttons, arrow keys, or a swipe.
+  const order = state.order || [], at = order.findIndex(c => c.id === clip.id);
+  if (order.length > 1 && at >= 0) {
+    const nav = document.createElement('div'); nav.className = 'detail-nav';
+    const prev = document.createElement('button'); prev.type = 'button'; prev.className = 'btn'; prev.textContent = '‹'; prev.setAttribute('aria-label', 'Previous item'); prev.addEventListener('click', () => stepDetail(-1));
+    const pos = document.createElement('span'); pos.className = 'pos'; pos.textContent = `${at + 1} of ${order.length}`;
+    const next = document.createElement('button'); next.type = 'button'; next.className = 'btn'; next.textContent = '›'; next.setAttribute('aria-label', 'Next item'); next.addEventListener('click', () => stepDetail(1));
+    nav.append(prev, pos, next); d.append(nav);
+  }
+
   const cover = clip.detailCover || clip.cover || clip.media?.[0]?.src;
   if (cover) {
     const img = document.createElement('img');
@@ -1160,6 +1172,26 @@ function linkButton(text, href, external) {
   if (external) { a.target = '_blank'; a.rel = 'noopener noreferrer'; }
   return a;
 }
+
+/** Open the neighbouring item in review order and bring its tile under the camera at the current scale. */
+function stepDetail(delta) {
+  const order = state.order || [];
+  const i = order.findIndex(c => c.id === state.selected);
+  if (i < 0 || order.length < 2) return;
+  const clip = order[((i + delta) % order.length + order.length) % order.length];
+  openDetail(clip);
+  if (state.spatialOn) return;
+  const p = [...state.positions.values()].find(t => t.clip.id === clip.id);
+  if (!p) return;
+  const r = el.stage.getBoundingClientRect(), s = viewport.scale;
+  viewport.panTo(r.width / 2 - (p.x + p.w / 2) * s, r.height / 2 - (p.y + p.h / 2) * s, { duration: 300 });
+}
+// Swipe across the detail pane steps through the review order (phones).
+{ let start = null;
+  el.detail.addEventListener('pointerdown', e => { start = e.pointerType === 'touch' && !e.target.closest('.detail-resize') ? { x: e.clientX, y: e.clientY } : null; });
+  el.detail.addEventListener('pointerup', e => { if (!start) return; const dx = e.clientX - start.x, dy = e.clientY - start.y; start = null;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > 2 * Math.abs(dy)) stepDetail(dx < 0 ? 1 : -1); });
+  el.detail.addEventListener('pointercancel', () => { start = null; }); }
 
 function closeDetail() {
   state.unresolvedFocus = null; state.detailMedia = null;
@@ -1276,6 +1308,9 @@ window.addEventListener('keydown', (e) => {
     closeDetail(); el.search.blur(); return;
   }
   if (typing) return;
+  if (state.selected && (e.key === 'ArrowRight' || e.key === 'ArrowLeft') && !e.target.closest?.('.detail-resize')) {
+    e.preventDefault(); stepDetail(e.key === 'ArrowRight' ? 1 : -1); return;
+  }
 
   if (e.key === '/') { e.preventDefault(); el.search.focus(); }
   else if (e.key === '0') fitWall();
