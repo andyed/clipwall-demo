@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipwall</title>
+<link rel="stylesheet" href="wall/wall.css">
+<link rel="stylesheet" href="wall/attribute-brush.css">
+  <link rel="stylesheet" href="wall/spatial/spatial.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="main-controls">
+  <span class="brand">clipwall</span>
+  <button class="btn" id="toggle-rail" type="button" title="Toggle filters">☰</button>
+  <input class="search" id="search" type="search" placeholder="Search titles, notes, tags…" autocomplete="off">
+  <label for="group">group</label>
+  <select class="select" id="group"></select>
+  <div class="zoomctl">
+    <button class="btn" id="view-3d" type="button" aria-pressed="false"
+            title="Spatial view (3)">3D</button>
+    <button class="btn" id="zoom-out" type="button" title="Zoom out (−)">−</button>
+    <button class="btn" id="zoom-fit" type="button" title="Fit (0)">Fit</button>
+    <button class="btn" id="zoom-in" type="button" title="Zoom in (+)">+</button>
+  </div>
+  <select class="select pan-behavior" id="pan-behavior" aria-label="Pan behavior" title="Experimental flat-canvas pan behavior">
+    <option value="free">Free pan</option>
+    <option value="bounded">Bounded pan</option>
+    <option value="edge">Edge zoom (test)</option>
+  </select>
+  <button class="btn" id="copy-view" type="button">Copy link</button>
+  <span class="count" id="count" role="status" aria-live="polite"></span>
+  </div>
+  <div class="review-controls" aria-label="Review arrangement and attribute preview">
+    <label for="sort-key">Sort within groups</label>
+    <select class="select" id="sort-key" aria-label="Sort within groups"></select>
+    <button class="btn" id="sort-direction" type="button" aria-label="Sort ascending">↑ Ascending</button>
+    <label for="attribute-lens">Attribute lens</label>
+    <select class="select" id="attribute-lens" aria-label="Pinned attribute lens"></select>
+    <div class="review-tip" id="review-tip"><span class="brush-idle">Hover an attribute heading to explore its distribution.<br>Hover a value to find matches. Click a heading to pin its lens.</span></div>
+  </div>
+</header>
+
+<div id="link-status" role="status" hidden><span id="link-message"></span> <button class="btn" id="new-view" type="button">New view</button></div>
+
+<nav class="rail" id="rail" aria-label="Filters"></nav>
+
+<section id="scope-bar" class="scope-bar" aria-label="Working scope" hidden>
+  <button class="btn" id="scope-back" type="button">Back</button>
+  <div id="scope-summary"></div>
+  <button class="btn" id="scope-clear" type="button">All content</button>
+</section>
+<section id="context-clusters" class="context-clusters" aria-label="Alternate clusters outside the current scope" hidden>
+  <div class="context-heading"><strong>Outside this scope</strong><span id="context-preview" role="status"></span></div>
+  <div id="context-list"></div>
+</section>
+
+<main class="stage" id="stage">
+  <div class="bg-plane" id="bg-plane" hidden></div>
+  <div class="canvas" id="canvas"></div>
+  <div class="sp-host" id="sp-host" hidden></div>
+  <button class="row-title" id="row-title" type="button" hidden title="Next group (click) · previous (Shift-click) · ] and [ keys">
+    <strong></strong><span class="n"></span><span class="pos"></span><span class="next" aria-hidden="true">›</span>
+  </button>
+</main>
+
+<aside class="detail" id="detail" aria-label="Clip detail"></aside>
+
+<div class="empty hidden" id="empty"></div>
+
+<p class="hint">
+  <span class="edge-feedback" id="edge-feedback" role="status"></span>
+  <button class="btn" id="edge-undo" type="button" hidden>Undo edge zoom</button>
+  scroll to pan · <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + scroll to zoom · drag to pan · <kbd>0</kbd> fit · <kbd>/</kbd> search
+</p>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="wall/wall.mjs"></script>
+</body>
+</html>

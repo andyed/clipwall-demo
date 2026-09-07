@@ -1,0 +1,85 @@
+/* clipwall — spatial view.
+ *
+ * Contrast: every readable string here clears 8:1 against the ground it sits
+ * on. The card ground is #0d1017; --sp-ink #e8e6da measures 15.19:1 and the
+ * metadata tier #b0aea2 measures 8.54:1. A third, dimmer tier does not fit above
+ * the floor on this ground, so secondary text separates by size and letter-
+ * spacing instead of by contrast.
+ */
+
+.sp-host {
+  position: absolute; inset: 0;
+  background: #07070d;
+  overflow: hidden;
+  touch-action: none;
+}
+.sp-host[hidden] { display: none !important; }
+
+#sp-webgl, #sp-css3d { position: absolute; inset: 0; }
+#sp-webgl { z-index: 1; }
+#sp-css3d { z-index: 2; pointer-events: none; }
+#sp-css3d .sp-card, #sp-css3d .sp-card * { pointer-events: auto; }
+#sp-css3d:focus { outline: none; }
+
+.sp-card {
+  width: 340px;
+  box-sizing: border-box;
+  aspect-ratio: var(--tile-aspect, 4 / 3);
+  background: #0d1017;
+  border: 1px solid rgba(127, 223, 255, 0.5);
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.75);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+/* Keyboard selection is heavier than hover, not lighter: it is the only
+ * position indicator a keyboard user has. */
+.sp-card[aria-selected="true"] {
+  outline: 4px solid #ffd166;
+  outline-offset: 3px;
+  border-color: #ffd166;
+}
+.sp-card.broken { border-color: #ff8a8a; }
+
+.sp-thumb {
+  display: block; width: 100%;
+  aspect-ratio: var(--tile-aspect, 4 / 3);
+  object-fit: cover;
+  background: #1b2430;
+}
+.sp-body { visibility: hidden; position: absolute; inset: auto 0 0; padding: 8px 10px; background: #0d1017; max-height: 40%; overflow: hidden; }
+.sp-t {
+  font-size: 15px; line-height: 1.28; font-weight: 600;
+  color: #e8e6da;                       /* 15.19:1 on #0d1017 */
+  overflow-wrap: anywhere;
+}
+.sp-m {
+  margin-top: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; letter-spacing: 0.03em;
+  color: #b0aea2;                       /* 8.54:1 on #0d1017 */
+}
+.sp-edit {
+  display: inline-block; margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #8fd9ff;                       /* 12.27:1 on #0d1017 */
+  text-decoration: underline;
+}
+
+.sp-pile-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: center;
+  color: #e8e6da;                       /* 16.04:1 on #07070d */
+  white-space: nowrap;
+  text-shadow: 0 2px 10px #07070d, 0 0 3px #07070d;
+  pointer-events: none;
+}
+.sp-pile-label .n { font-size: 26px; letter-spacing: 0.1em; text-transform: uppercase; }
+.sp-pile-label .c { font-size: 20px; color: #8fd9ff; margin-left: 10px; }
+
+.sp-back { position: absolute; z-index: 4; top: 12px; left: 12px; background: #0d1017; color: #e8e6da; }
+.sp-back[hidden] { display: none; }
+
+.sp-card:hover .sp-body, .sp-card[aria-selected="true"] .sp-body { visibility: visible; }
