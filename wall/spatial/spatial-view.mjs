@@ -641,6 +641,14 @@ export class SpatialView {
     const byKey = new Map();
     this.clips.forEach((clip, i) => byKey.set(keyOfClip(clip), i));
     const result = this.piles.restore(state, (k) => (byKey.has(k) ? byKey.get(k) : -1));
+    // Saved piles may share members too: place each clip in its smallest pile,
+    // keep the full membership for spreading and the true count for the label.
+    { const placed = new Set();
+      for (const p of [...this.piles.piles].sort((a, b) => a.indices.length - b.indices.length)) {
+        p.all = p.indices; p.count = p.indices.length;
+        p.exclusive = p.all.filter(i => !placed.has(i)); for (const i of p.exclusive) placed.add(i);
+        p.indices = p.exclusive;
+      } }
     this.mode = 'piles';
     this.hybrid.promoteDistance = Infinity;
     this._generatedPiles = false;
