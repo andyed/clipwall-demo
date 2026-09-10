@@ -57,6 +57,7 @@ const state = {
   viewStateError: '',
   tileEls: new Map(),  // [group label, clip.id] occurrence -> element
   positions: new Map(), // occurrence -> {clip,x,y,w,h}
+  preview: null,        // transiently shown in Dive by hover; never selection, never ViewSpec
   bgTileEls: new Map(), // background-plane occurrence -> element (mounted only while revealed)
   bgPositions: new Map()
 };
@@ -771,6 +772,8 @@ function buildTile(clip, { background = false } = {}) {
     if ((viewport.lastDragDistance || 0) > 4) return;
     open();
   });
+  node.addEventListener('pointerenter', (e) => hoverPreview(clip, e));
+  node.addEventListener('pointerleave', hoverEnd);
   node.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
   });
@@ -874,6 +877,8 @@ function flowCard(key, p) {
     for (const img of card.querySelectorAll('img')) { img.alt = ''; img.draggable = false; img.decoding = 'async'; }
     card.addEventListener('click', () => { if ((viewport.lastDragDistance || 0) > 4) return; if (card._clip) { openDetail(card._clip); for (const c of showcase.cards.values()) c.classList.toggle('selected', c === card); } });
     card.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && card._clip) { e.preventDefault(); openDetail(card._clip); } });
+    card.addEventListener('pointerenter', e => { if (card._clip) hoverPreview(card._clip, e); });
+    card.addEventListener('pointerleave', hoverEnd);
     showcase.cards.set(key, card); flowPlane.append(card);
   }
   card.style.width = `${p.w}px`; card.style.height = `${p.h}px`; card.style.transform = `translate(${p.x}px, ${p.y}px)`;
@@ -1223,12 +1228,82 @@ document.getElementById('attribute-lens').addEventListener('change', e => brush.
 
 /* -------------------------------------------------------------- detail --- */
 
+/* Hover preview -------------------------------------------------------------
+ * Once Dive is open, hovering a tile shows that clip in the pane instead of the
+ * selected one, and a click commits it. The preview is transient BY
+ * CONSTRUCTION, not by convention: it writes only `state.preview`, which
+ * nothing serialises. `state.selected` is what reaches ViewSpec.ui.focus, so a
+ * hover cannot change the permalink (PERMALINKS.md: "Do not record hover"),
+ * cannot move a tile, and cannot move the `.selected` ring off the committed
+ * clip — the ring is how you can still see what you will return to.
+ */
+const PREVIEW_DELAY = 120;   // a pointer crossing tiles on its way elsewhere is not a hover
+let previewTimer = null, previewMedia = null;
+
+function hoverPreview(clip, e) {
+  if (!state.selected) return;                              // nothing to override outside Dive
+  if (e && (e.buttons !== 0 || e.pointerType === 'touch')) return;  // a pan is not a hover
+  clearTimeout(previewTimer);
+  if (clip.id === state.selected) { endPreview(); return; } // hovering home returns home
+  if (state.preview === clip.id) return;
+  previewTimer = setTimeout(() => showPreview(clip), PREVIEW_DELAY);
+}
+
+function showPreview(clip) {
+  if (!state.selected || clip.id === state.selected) return;
+  if (state.preview === null) previewMedia = state.detailMedia;  // hold the committed frame
+  state.preview = clip.id;
+  state.detailMedia = null;
+  el.detail.dataset.preview = 'true';
+  renderDetail(clip);
+}
+
+/** Leaving a tile ends the preview, unless the pointer is on its way into the pane. */
+function hoverEnd() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => endPreview(), PREVIEW_DELAY);
+}
+
+function endPreview({ silent = false } = {}) {
+  clearTimeout(previewTimer);
+  if (state.preview === null) return;
+  state.preview = null;
+  state.detailMedia = previewMedia; previewMedia = null;
+  delete el.detail.dataset.preview;
+  if (silent) return;                                       // caller renders its own clip next
+  const clip = state.clips.find(c => c.id === state.selected);
+  if (clip) renderDetail(clip);
+}
+
+/** Promote the previewed clip to the selection. */
+function commitPreview() {
+  const clip = state.preview && state.clips.find(c => c.id === state.preview);
+  if (clip) openDetail(clip);
+  return !!clip;
+}
+
+// Reading the preview keeps it: the pointer entering the pane cancels the end.
+// Clicking a non-interactive part of it commits, so the pane itself is a target
+// for "yes, this one" without going back to the tile.
+el.detail.addEventListener('pointerenter', () => clearTimeout(previewTimer));
+el.detail.addEventListener('pointerleave', () => { if (state.preview) hoverEnd(); });
+el.detail.addEventListener('click', (e) => {
+  if (state.preview && !e.target.closest('a, button, .thumbs img')) commitPreview();
+});
+
+/** Commit a clip as the selection and show it. The only path that writes state.selected. */
 function openDetail(clip) {
+  endPreview({ silent: true });
   state.unresolvedFocus = null; state.detailMedia = null;
   state.selected = clip.id;
   for (const [key, node] of state.tileEls) node.classList.toggle('selected', state.positions.get(key)?.clip.id === clip.id);
   for (const [key, node] of state.bgTileEls) node.classList.toggle('selected', state.bgPositions.get(key)?.clip.id === clip.id);
+  renderDetail(clip);
+  detailPane.open();
+}
 
+/** Paint one clip into the pane. Says nothing about selection — a preview renders through here too. */
+function renderDetail(clip) {
   const d = detailPane.content;
   d.replaceChildren();
 
@@ -1355,7 +1430,12 @@ function openDetail(clip) {
     d.append(thumbs);
   }
 
-  detailPane.open();
+  // A media choice outlives a re-render: endPreview() repaints the committed
+  // clip and must land on the frame the user had picked, not back on the cover.
+  if (state.detailMedia) {
+    const img = d.querySelector('img');
+    if (img && clip.media?.some(m => m.src === state.detailMedia)) img.src = state.detailMedia;
+  }
 }
 
 /** Search deep links per service: [label, href, service name]. */
@@ -1397,6 +1477,7 @@ function stepDetail(delta) {
   el.detail.addEventListener('pointercancel', () => { start = null; }); }
 
 function closeDetail() {
+  endPreview({ silent: true });
   state.unresolvedFocus = null; state.detailMedia = null;
   detailPane.close();
   state.selected = null;
@@ -1500,7 +1581,10 @@ el.stage.addEventListener('dblclick', (e) => { if (!state.spatialOn) viewport.zo
 
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && el.detail.classList.contains('open')) {
-    closeDetail(); e.stopPropagation();
+    // Escape unwinds one level at a time: drop the preview back to the selected
+    // clip first, and only close the pane once there is no preview to drop.
+    if (state.preview) endPreview(); else closeDetail();
+    e.stopPropagation();
   }
 }, true);
 
@@ -1511,8 +1595,12 @@ window.addEventListener('keydown', (e) => {
     closeDetail(); el.search.blur(); return;
   }
   if (typing) return;
+  if (state.preview && e.key === 'Enter' && !typing) { e.preventDefault(); commitPreview(); return; }
+
   if (state.selected && (e.key === 'ArrowRight' || e.key === 'ArrowLeft') && !e.target.closest?.('.detail-resize')) {
-    e.preventDefault(); stepDetail(e.key === 'ArrowRight' ? 1 : -1); return;
+    // The arrows walk the review order from the SELECTION, so a hover in flight
+    // is dropped rather than silently becoming the thing you stepped from.
+    e.preventDefault(); endPreview(); stepDetail(e.key === 'ArrowRight' ? 1 : -1); return;
   }
 
   if (e.key === '/') { e.preventDefault(); el.search.focus(); }

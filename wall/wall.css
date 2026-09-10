@@ -391,6 +391,37 @@ body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; us
 .detail-resize:hover::after, .detail-resize:focus-visible::after { background: var(--accent-text); }
 .detail-resize:focus-visible { outline: 2px solid var(--accent-text); outline-offset: -2px; }
 .detail-content > img { max-height: max(160px, calc(100dvh - var(--bar-h) - 104px)); object-fit: contain; }
+
+/* Hover preview: the pane is showing something you have NOT selected. The cue
+ * has to be on the pane, not in its content, because the content is rebuilt on
+ * every hover and a badge inside it would scroll away from the thing it labels.
+ * #aaffaa on --panel is 16.2:1; the pill's own ground is a tint of the same
+ * panel, so the measured floor holds. */
+.detail[data-preview] { border-left: 1px dashed rgba(var(--accent-rgb), 0.55); }
+/* The pill is pinned to the PANE, so padding at the end of the scroll content
+   does not clear it — scrolled to the top, the pill still lands on whatever row
+   sits at the bottom edge. Shorten the scroll box instead and give the pill a
+   band of its own. */
+.detail[data-preview] .detail-content { height: calc(100% - 56px); }
+.detail[data-preview]::after {
+  content: 'Preview · click to select';
+  position: absolute;
+  left: 24px;
+  bottom: 16px;
+  z-index: 3;
+  padding: 5px 10px;
+  border: 1px solid rgba(var(--accent-rgb), 0.45);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--accent-text);   /* 16.2:1 on --panel, 15.3:1 on --panel-2 */
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .detail[data-preview]::after { animation: preview-in 0.16s ease-out; }
+  @keyframes preview-in { from { opacity: 0; transform: translateY(4px); } }
+}
 @media (max-width: 800px) {
   body { --detail-size: 100vw; }
   body.detail-open .stage { right: 0; }
