@@ -19,6 +19,7 @@
   --border: rgba(var(--accent-rgb), 0.22);
   --scrim: rgba(5, 5, 16, 0.92);
   --bar-h: 56px;
+  --share-feather: 5px;   /* softens the fill edge off the letterforms */
 }
 
 * { box-sizing: border-box; }
@@ -158,21 +159,62 @@ html, body {
   cursor: pointer;
   max-width: 100%;
 }
-.chip:hover { color: var(--text); background: rgba(var(--accent-rgb), 0.12); }
+.chip:hover { color: var(--text); background-color: rgba(var(--accent-rgb), 0.12); }
 .chip:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.8); }
-.chip .n { font-variant-numeric: tabular-nums; opacity: 0.85; font-size: 10.5px; }
+.chip .n { font-variant-numeric: tabular-nums; font-size: 10.5px; }
 .chip-more { border-style: dashed; color: var(--muted); }
 .chip-more:hover { color: var(--text); }
 
 /* Active state is a SOLID fill with a paired dark label — a thin accent
  * outline would fail the floor the moment the accent hue is jogged. */
 .chip[aria-pressed="true"] {
-  background: rgb(var(--accent-rgb));
+  background-color: rgb(var(--accent-rgb));
   border-color: rgb(var(--accent-rgb));
   color: var(--accent-on);
   font-weight: 600;
 }
-.chip[aria-pressed="true"] .n { opacity: 0.72; }
+.chip[aria-pressed="true"] .n { font-weight: 500; }
+
+/* ---------- facet share ----------
+ * How much of a chip's own count survives the current scope, drawn as a fill
+ * from the leading edge. A hard stop, not a soft ramp: a blurred edge cannot be
+ * read as a quantity, and the whole point is that the edge is the number.
+ *
+ * Contrast governs the two alphas, measured against the text that sits ON the
+ * fill, not beside it:
+ *   unselected  --muted on 12% accent over --panel-2   8.62:1
+ *   selected    --accent-on under a 20% scrim on accent 9.40:1
+ * Both clear the 8:1 floor, and both are the WORST case — the unfilled half of
+ * each chip is the untouched ground, which scores higher.
+ *
+ * The edge carries a 5px feather. Fully hard, it lands mid-glyph on about half
+ * the chips and every letter it crosses straddles two grounds; 5px is short
+ * enough that the edge still reads as a position — the quantity survives — and
+ * long enough that no letterform sits on a seam. Both grounds are measured
+ * above, so the ramp between them cannot dip under either.
+ *
+ * Only drawn while [data-share] is set, i.e. only while a scope exists; with no
+ * scope every chip is full and a rail of full chips says nothing. */
+.chip[data-share] {
+  background-image: linear-gradient(90deg,
+    rgba(var(--accent-rgb), 0.12) 0 calc(var(--share, 0) * 100% - var(--share-feather)),
+    transparent calc(var(--share, 0) * 100% + var(--share-feather)));
+}
+.chip[aria-pressed="true"][data-share] {
+  /* Inverted: a selected chip is already a solid accent fill, so the SHARE is
+     the part left bright and the remainder is what gets shaded out. */
+  background-image: linear-gradient(90deg,
+    transparent 0 calc(var(--share, 0) * 100% - var(--share-feather)),
+    rgba(5, 5, 16, 0.20) calc(var(--share, 0) * 100% + var(--share-feather)));
+}
+/* Nothing of this value is in view. Not dimmed — dimming is the one move that
+   would cost contrast — and not dashed either, because .chip-more already owns
+   a dashed border and two meanings on one cue is no cue. Strike the number
+   instead: it says the figure beside it is currently void. */
+.chip[data-share="none"] .n { text-decoration: line-through; }
+@media (prefers-reduced-motion: no-preference) {
+  .chip[data-share] { transition: background-image 0.18s ease-out; }
+}
 
 /* ---------- stage ---------- */
 

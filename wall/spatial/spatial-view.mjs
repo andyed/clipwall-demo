@@ -82,10 +82,19 @@ export class SpatialView {
    * @param {HTMLElement} host element to mount into
    * @param {object} hooks
    * @param {(clip:object) => void} hooks.onOpen  open the detail panel
+   * @param {(clip:object) => void} [hooks.onHover]  the pointer rests on an item
+   * @param {() => void} [hooks.onHoverEnd]  the pointer has left every item
+   * @param {() => boolean} [hooks.hoverEnabled]  asked BEFORE each pick, so a
+   *   field nobody is previewing costs nothing
    */
-  constructor(host, { onOpen } = {}) {
+  constructor(host, { onOpen, onHover, onHoverEnd, hoverEnabled } = {}) {
     this.host = host;
     this.onOpen = onOpen || (() => {});
+    this.onHover = onHover || (() => {});
+    this.onHoverEnd = onHoverEnd || (() => {});
+    this.hoverEnabled = hoverEnabled || (() => false);
+    this._hovered = -1;
+    this._hoverFrame = 0;
     this.clips = [];
     this.groupKey = 'none';
     this.built = false;
@@ -300,6 +309,7 @@ export class SpatialView {
       build: (i, el) => this._buildCard(i, el),
       onActivate: (i) => this._activate(i),
     });
+    this._bindCardHover();
     if (this.nav) {
       this.nav.field = this.field;
       this.nav.hybrid = this.hybrid;
@@ -398,6 +408,68 @@ export class SpatialView {
     const pile = this.mode === 'piles' ? this.piles.pileOf(i) : -1;
     const where = pile >= 0 ? `, in ${this.piles.piles[pile].label}` : '';
     return `${clip.title || 'untitled'}, ${clip.source || 'unknown source'}${where}`;
+  }
+
+  /**
+   * Hover for the DOM twins. The pool elements are persistent, so this runs
+   * once per pool and reads entry.index at event time rather than closing over
+   * it — a pool entry is a different item a second from now.
+   */
+  _bindCardHover() {
+    for (const entry of this.hybrid.pool) {
+      if (entry.el.dataset.hoverBound) continue;
+      entry.el.dataset.hoverBound = '1';
+      // pointermove, not pointerenter: enter fires only on crossing the border,
+      // so a preview switched on while the pointer already rests on a card
+      // would wait for the pointer to leave and come back.
+      entry.el.addEventListener('pointermove', (e) => {
+        if (e.pointerType === 'touch' || e.buttons !== 0 || !this.hoverEnabled()) return;
+        if (entry.index < 0 || entry.index === this._hovered) return;
+        const clip = this._hoverTarget(entry.index);
+        if (!clip) return;
+        if (this._hoverFrame) { cancelAnimationFrame(this._hoverFrame); this._hoverFrame = 0; }
+        this._hovered = entry.index;
+        this.onHover(clip);
+      });
+      entry.el.addEventListener('pointerleave', (e) => {
+        if (e.pointerType === 'touch') return;
+        if (entry.index >= 0 && entry.index === this._hovered) this._endHover();
+      });
+    }
+  }
+
+  /** Resolve the item under the pointer and report it, once per frame. */
+  _pickHover(clientX, clientY) {
+    if (!this.built || !this.hoverEnabled()) return this._endHover();
+    const r = this.host.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const hit = this.field.pickAt(((clientX - r.left) / r.width) * 2 - 1,
+      -((clientY - r.top) / r.height) * 2 + 1, this.camera);
+    if (hit === this._hovered) return;              // same item, nothing to say
+    const clip = hit >= 0 ? this._hoverTarget(hit) : null;
+    this._hovered = clip ? hit : -1;
+    if (clip) this.onHover(clip); else this.onHoverEnd();
+  }
+
+  _endHover() {
+    if (this._hoverFrame) { cancelAnimationFrame(this._hoverFrame); this._hoverFrame = 0; }
+    if (this._hovered === -1) return;
+    this._hovered = -1;
+    this.onHoverEnd();
+  }
+
+  /**
+   * The clip a hit would open, or null. A collapsed pile is not an item — a
+   * click there spreads the stack — so hovering one must not preview anything.
+   * Mirrors _activate()'s branch deliberately: the two must agree, or hover
+   * shows one thing and the click that follows does another.
+   */
+  _hoverTarget(i) {
+    if (this.mode === 'piles') {
+      const pile = this.piles.pileOf(i);
+      if (pile >= 0 && this.piles.spreadPile !== pile) return null;
+    }
+    return this.clips[i] || null;
   }
 
   _activate(i) {
@@ -770,7 +842,29 @@ export class SpatialView {
       }
       down.lastX = e.clientX; down.lastY = e.clientY;
     });
-    el.addEventListener('pointercancel', () => { down = null; });
+    // Hover picks its own target rather than riding the drag handler above,
+    // which returns early unless a button is down. pickAt measured 0.28 ms mean
+    // / 0.4 ms p95 over 1793 instances (~1.6% of a 60fps frame), so the cost is
+    // affordable — but pointermove fires several times per frame, so coalesce
+    // to one pick per frame, and ask hoverEnabled() first so a field nobody is
+    // previewing pays nothing at all.
+    el.addEventListener('pointermove', (e) => {
+      if (down || e.pointerType === 'touch' || e.buttons !== 0) return;
+      // A promoted card owns its own hover, the same way pickAt() already skips
+      // suppressed instances so the DOM twin takes the click. Without this the
+      // field would pick -1 under every near card and cancel the preview the
+      // card just started.
+      if (e.target.closest?.('.sp-card')) return;
+      if (!this.hoverEnabled()) { this._endHover(); return; }
+      if (this._hoverFrame) return;
+      const { clientX, clientY } = e;
+      this._hoverFrame = requestAnimationFrame(() => {
+        this._hoverFrame = 0;
+        this._pickHover(clientX, clientY);
+      });
+    });
+    el.addEventListener('pointerleave', () => this._endHover());
+    el.addEventListener('pointercancel', () => { down = null; this._endHover(); });
     el.addEventListener('pointerup', (e) => {
       if (!down) return;
       e.stopPropagation();

@@ -14,7 +14,7 @@
 import { sortClips } from './attributes.mjs';
 import { createAttributeBrush } from './attribute-brush.mjs';
 import { createPermalinks, canonical } from './permalink.mjs';
-import { clipKey, filterScope, chooseCluster, contextClusters } from './context-clusters.mjs';
+import { clipKey, filterScope, chooseCluster, contextClusters, valuesOf } from './context-clusters.mjs';
 import { layout, frameAround, HEADER_H } from './layout.mjs';
 import { Viewport } from './viewport.mjs';
 import { createDetailPane } from './detail-pane.mjs';
@@ -290,6 +290,53 @@ function renderScope() {
   // Keep rail truth in sync after history and scope replacement.
   for (const chip of el.rail.querySelectorAll('[data-facet]'))
     chip.setAttribute('aria-pressed', String(state.active.get(chip.dataset.facet)?.has(chip.dataset.value) || false));
+  updateFacetShares(scoped);
+}
+
+/**
+ * A chip's number counts the whole collection, not the view — so once a scope
+ * narrows things, every number in the rail is describing a collection you are
+ * no longer looking at. Fill each chip left-to-right by the fraction of ITS
+ * OWN count that survives the current scope: a full chip is untouched by the
+ * filter, a tenth-full chip has ten percent of itself left, an empty one has
+ * nothing here at all.
+ *
+ * Unscoped, every fraction is 1 by definition and a wall of full chips would
+ * say nothing, so the fill is not drawn at all until there is a scope.
+ *
+ * The fill is decoration; the number it encodes goes in aria-label, because a
+ * proportion nobody can read is not a label.
+ */
+function updateFacetShares(scoped) {
+  const chips = [...el.rail.querySelectorAll('[data-facet]')];
+  if (!chips.length) return;
+  if (!scoped) {
+    for (const chip of chips) { delete chip.dataset.share; chip.style.removeProperty('--share'); setChipLabel(chip, null); }
+    return;
+  }
+  // One pass over the in-view clips per facet key present in the rail.
+  const keys = [...new Set(chips.map(c => c.dataset.facet))];
+  const counts = new Map(keys.map(k => [k, new Map()]));
+  for (const clip of state.filtered)
+    for (const key of keys) {
+      const bucket = counts.get(key);
+      for (const value of valuesOf(clip, key)) bucket.set(value, (bucket.get(value) || 0) + 1);
+    }
+  for (const chip of chips) {
+    const total = Number(chip.dataset.total) || 0;
+    const inView = counts.get(chip.dataset.facet)?.get(chip.dataset.value) || 0;
+    const share = total > 0 ? Math.min(1, inView / total) : 0;
+    chip.dataset.share = share === 0 ? 'none' : share >= 0.999 ? 'all' : 'part';
+    chip.style.setProperty('--share', String(share));
+    setChipLabel(chip, inView);
+  }
+}
+
+/** Say the proportion in words; the gradient only draws it. */
+function setChipLabel(chip, inView) {
+  const total = chip.dataset.total, value = chip.dataset.value;
+  if (inView === null) chip.setAttribute('aria-label', `${value}, ${total} in the collection`);
+  else chip.setAttribute('aria-label', `${value}, ${inView} of ${total} in view`);
 }
 function renderContext() {
   const host = document.getElementById('context-clusters');
@@ -504,7 +551,15 @@ async function toggleSpatial(on) {
       // Module-relative: the static demo is served from a sub-path, where /wall/… would 404.
       const { SpatialView, keyOfClip } = await import('./spatial/spatial-view.mjs');
       state.clipKey = keyOfClip;
-      state.spatial = new SpatialView(el.spHost, { onOpen: openDetail });
+      state.spatial = new SpatialView(el.spHost, {
+        onOpen: openDetail,
+        // Same preview the flat wall uses. The view guards touch and drag and
+        // coalesces to one pick per frame; hoverEnabled keeps it from picking
+        // at all until there is a selection for a preview to override.
+        onHover: (clip) => hoverPreview(clip),
+        onHoverEnd: hoverEnd,
+        hoverEnabled: () => !!state.selected,
+      });
       await loadViewState();
     } catch (err) {
       // three.js comes from a CDN; offline, this is the failure. Say so rather
@@ -521,6 +576,10 @@ async function toggleSpatial(on) {
   document.getElementById('edge-feedback').hidden = on;
   document.getElementById('pan-behavior').disabled = on;
   state.spatialOn = on;
+  // Switching representation drops any hover in flight: the pointer is over a
+  // surface that is about to stop existing, and no leave event is coming.
+  endPreview();
+  state.spatial?._endHover?.();
   brush.setEnabled(!on);
   for (const id of ['sort-key', 'sort-direction', 'attribute-lens']) document.getElementById(id).disabled = on;
   updateSortDirection();
@@ -1143,7 +1202,7 @@ function buildFacetRail() {
       chip.className = 'chip';
       chip.type = 'button';
       chip.setAttribute('aria-pressed', String(state.active.get(key)?.has(value) || false));
-      chip.dataset.facet = key; chip.dataset.value = value;
+      chip.dataset.facet = key; chip.dataset.value = value; chip.dataset.total = String(n);
       const label = document.createElement('span');
       label.textContent = value;                     // untrusted
       const num = document.createElement('span');
@@ -1237,7 +1296,16 @@ document.getElementById('attribute-lens').addEventListener('change', e => brush.
  * cannot move a tile, and cannot move the `.selected` ring off the committed
  * clip — the ring is how you can still see what you will return to.
  */
-const PREVIEW_DELAY = 120;   // a pointer crossing tiles on its way elsewhere is not a hover
+// A DWELL, not a hover. The pane sits to the right of the wall, so the pointer
+// reaches its links — Open original, YouTube Music, Apple Music — by crossing
+// whatever tiles lie between. At a tooltip-length delay each of those counted
+// as a hover and swapped the pane out from under the cursor, which made the
+// links in it unclickable. The pointer must now stop and stay stopped.
+const PREVIEW_DWELL = 500;
+// And leaving a tile does not end the preview immediately, because the journey
+// to the pane starts by leaving a tile. The pane's own pointerenter cancels
+// this; the grace only has to outlast the gap between the two.
+const PREVIEW_LINGER = 320;
 let previewTimer = null, previewMedia = null;
 
 function hoverPreview(clip, e) {
@@ -1246,7 +1314,7 @@ function hoverPreview(clip, e) {
   clearTimeout(previewTimer);
   if (clip.id === state.selected) { endPreview(); return; } // hovering home returns home
   if (state.preview === clip.id) return;
-  previewTimer = setTimeout(() => showPreview(clip), PREVIEW_DELAY);
+  previewTimer = setTimeout(() => showPreview(clip), PREVIEW_DWELL);
 }
 
 function showPreview(clip) {
@@ -1261,7 +1329,7 @@ function showPreview(clip) {
 /** Leaving a tile ends the preview, unless the pointer is on its way into the pane. */
 function hoverEnd() {
   clearTimeout(previewTimer);
-  previewTimer = setTimeout(() => endPreview(), PREVIEW_DELAY);
+  previewTimer = setTimeout(() => endPreview(), PREVIEW_LINGER);
 }
 
 function endPreview({ silent = false } = {}) {
