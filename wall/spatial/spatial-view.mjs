@@ -24,6 +24,7 @@ import { TileField } from './lib/instanced.js';
 import { HybridField } from './lib/hybrid.js';
 import { PileLayout } from './lib/piles.js';
 import { FieldNavigator } from './lib/navigate.js';
+import { CardHost, supported as drawableSupported } from './lib/cards.js';
 import { RowMotion } from './lib/motion.js';
 import { groupBy, layout } from '../layout.mjs';
 
@@ -214,8 +215,47 @@ export class SpatialView {
   _replaceField() {
     this.hybrid?.dispose();
     this.field?.dispose();
+    this.cardHost?.dispose();
+    this.cardHost = null;
+    this._lastFind = -1;
+    this._lastFindKey = '';
+    this._findArmed = false;
+    this._unsubscribePaint?.();
+    this._unsubscribePaint = null;
 
     const clips = this.clips;
+
+    // Drawable cards: source near-tier tiles from live DOM instead of images,
+    // so a tile keeps its text in find-in-page and Cmd+F can move the camera.
+    // Chrome-only and off unless the API is present; when off, everything
+    // below is skipped and the view is byte-for-byte its previous self.
+    // `.sp-host[hidden]` is display:none, where a card has no layout box and
+    // no paint record — so building the host then would fail every tile
+    // permanently. The normal path is safe (wall.mjs unhides before calling
+    // setClips) and this guard covers the constructor's first, empty build.
+    const drawable = (window.__cwDrawable ?? drawableSupported()) && !this.host.hidden;
+    if (drawable && clips.length) {
+      this.cardHost = new CardHost({
+        container: this.host,
+        count: clips.length,
+        width: 340,
+        height: 255,
+        // NOT `sp-card`: that class is the DOM-overlay pool, and both the
+        // tests and the CSS3D layer select on it. A drawable card is never an
+        // overlay. It shares the visual rules via a grouped selector instead.
+        className: 'sp-dcard',
+        // Same builder as the DOM pool, with the hero proxied: cross-origin
+        // content inside a drawable renders blank, and 27% of harvested heroes
+        // have no CORS headers.
+        build: (i, el) => this._buildCard(i, el, { proxyHero: true }),
+      });
+      // `settled()` waits for the hero images, which is when the find
+      // handler below can be armed: an <img> finishing load repaints its card
+      // and is indistinguishable from a find match at the event level.
+      const host = this.cardHost;
+      host.settled().then(() => { if (this.cardHost === host) this._findArmed = true; });
+    }
+
     this.field = new TileField({
       scene: this.scene,
       // The atlas requires nonzero backing dimensions. An empty filter still
@@ -229,6 +269,20 @@ export class SpatialView {
         // Both tiers use the captured file until capture has a thumb ladder.
         return src ? proxied(src) : null;
       },
+      // Near tier only. The far atlas is the whole corpus resident at once, and
+      // there is no reason to pay a capture for a tile that is a few pixels of
+      // colour. Returning null for 'far' falls through to the image path.
+      // `_capturing` brackets our own drawElementImage calls: a capture
+      // repaints the card, and a repaint is indistinguishable from a find at
+      // the event level.
+      resolveSource: this.cardHost
+        ? (i, tier) => {
+          if (tier !== 'near' || this.host.hidden) return null;
+          this._capturing = true;
+          try { return this.cardHost?.capture(i) ?? null; }
+          finally { queueMicrotask(() => { this._capturing = false; }); }
+        }
+        : null,
     });
     this.field.count = clips.length;
     this.field.mesh.count = clips.length;
@@ -253,12 +307,42 @@ export class SpatialView {
       this.nav.container.removeAttribute('aria-activedescendant');
       this.nav.live.textContent = '';
     }
+    // Find-in-page, measured against Chrome's real find bar (NOT window.find,
+    // which takes a different path and gives opposite evidence):
+    //
+    //   * `changedElements` is exactly the set of cards matching the current
+    //     query, narrowing as the user types. It is a precise signal.
+    //   * The find bar leaves NO DOM selection, so there is nothing else to
+    //     key on.
+    //   * Opening or closing the bar repaints every card, as does our own
+    //     capture pass — so a whole-corpus set is the one shape to ignore.
+    //
+    // A find therefore answers with a SET, and the camera fits the set rather
+    // than flying to a guessed single match. Scope is untouched either way:
+    // this moves the camera and the selection, never `state.filtered`.
+    if (this.cardHost) {
+      this._unsubscribePaint = this.cardHost.onPaint((indices) => {
+        if (!this._findArmed || this._capturing) return;
+        if (!indices.length || indices.length === this.clips.length) return;
+        const key = indices.join(',');
+        if (key === this._lastFindKey) return;
+        this._lastFindKey = key;
+        this._lastFind = indices[0];
+        for (const i of indices.slice(0, 32)) this.field.atlases.request(i, 'near');
+        this.hybrid?.setFocus(indices[0]);
+        this.nav?.select(indices[0]);
+        this.fit(indices);
+      });
+    }
+
     this._everPlaced = false;
   }
 
+
+
   /* ------------------------------------------------------------ cards --- */
 
-  _buildCard(i, el) {
+  _buildCard(i, el, { proxyHero = false } = {}) {
     const clip = this.clips[i];
     if (!clip) return;
 
@@ -266,7 +350,10 @@ export class SpatialView {
     if (src) {
       const img = document.createElement('img');
       img.className = 'sp-thumb';
-      img.src = src;
+      // The DOM pool renders a plain <img> and is fine cross-origin. A drawable
+      // is not: cross-origin content inside one is dropped from the snapshot,
+      // leaving the hero blank while the rest of the card draws.
+      img.src = proxyHero ? proxied(src) : src;
       img.alt = '';
       img.draggable = false;
       img.addEventListener('error', () => el.classList.add('broken'), { once: true });

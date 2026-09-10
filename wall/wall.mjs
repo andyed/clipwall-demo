@@ -1287,6 +1287,32 @@ function openDetail(clip) {
     d.append(attrs);
   }
 
+  // Listen: an album (and each track) opens a search on YouTube Music or
+  // Apple Music. Search links need no keys and Apple's page hands off to the
+  // app on macOS and iOS. Local playback (Psychodeli) is a later hook; the
+  // record already carries the file locations for it.
+  if (clip.artist && clip.album) {
+    const listen = document.createElement('div'); listen.className = 'listen';
+    for (const [text, href] of listenLinks(`${clip.artist} ${clip.album}`)) listen.append(linkButton(text, href, true));
+    d.append(listen);
+    if (clip.tracks?.length) {
+      const list = document.createElement('ol'); list.className = 'tracks';
+      for (const track of clip.tracks) {
+        const li = document.createElement('li');
+        const name = document.createElement('span'); name.className = 'track'; name.textContent = track;
+        li.append(name);
+        for (const [text, href, service] of listenLinks(`${clip.artist} ${track}`)) {
+          const a = document.createElement('a'); a.className = 'btn play'; a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.textContent = text === 'YouTube Music ↗' ? '▶' : '';
+          a.setAttribute('aria-label', `Play ${track} on ${service}`);
+          li.append(a);
+        }
+        list.append(li);
+      }
+      d.append(list);
+    }
+  }
+
   const actions = document.createElement('div');
   actions.className = 'actions';
   if (clip.sourceUrl || clip.url) actions.append(linkButton(clip.sourceLabel || 'Open source ↗', clip.sourceUrl || clip.url, true));
@@ -1330,6 +1356,15 @@ function openDetail(clip) {
   }
 
   detailPane.open();
+}
+
+/** Search deep links per service: [label, href, service name]. */
+function listenLinks(query) {
+  const q = encodeURIComponent(query);
+  return [
+    ['YouTube Music ↗', `https://music.youtube.com/search?q=${q}`, 'YouTube Music'],
+    ['Apple Music ↗', `https://music.apple.com/us/search?term=${q}`, 'Apple Music'],
+  ];
 }
 
 function linkButton(text, href, external) {
