@@ -103,8 +103,20 @@ function linkNotice(message) {
   document.getElementById('link-message').textContent = message;
   document.getElementById('link-status').hidden = !message;
 }
+/**
+ * The current view as a portable ViewSpec, or null when there is not yet a view
+ * to describe.
+ *
+ * A stage with no layout box — an unrendered tab, a display:none ancestor, a
+ * frame before first layout — is not an invalid view, it is a view that has not
+ * happened yet. Returning {w:0,h:0} made validateView reject it as "Invalid or
+ * unsupported view link", which is both the wrong diagnosis and, on the one
+ * unguarded call site, fatal to the whole permalink layer for that page load.
+ * Say "not yet" instead and let the caller come back.
+ */
 function captureView() {
   const r = el.stage.getBoundingClientRect();
+  if (!(r.width > 0 && r.height > 0)) return null;
   const preferred = parseFloat(document.body.style.getPropertyValue('--detail-preferred'));
   const spatial = state.spatial?.captureView() || null;
   const originalArrangement = state.arrangementOverride || state.viewState.doc;

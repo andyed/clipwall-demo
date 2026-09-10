@@ -56,7 +56,7 @@ export async function viewDigest(v) {
 /** URL updates share one serialized pipeline. Inline fallback is immediately
  * current; reference URLs are advertised only after durable server readback. */
 export function createPermalinks({ capture, restore, notice, onHistory }) {
-  let snapshotsAbsent = false; // the snapshot endpoint answered 404/405: static hosting
+  let snapshotsAbsent = false; // the snapshot endpoint is absent: static hosting
   let ready = false, blocked = false, restoring = false, last = '', lastSemantic = '', generation = 0;
   let pointerActive = false;
   window.addEventListener('pointerdown', () => { pointerActive = true; }, true);
@@ -79,7 +79,9 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
   const urlFor = fragment => { const u = new URL(location.href); u.hash = fragment; return u.href; };
   const flush = async (force = false) => {
     if (!ready || restoring || blocked) return pending;
-    const v = validateView(capture()), text = canonical(v);
+    const raw = capture();
+    if (!raw) return pending;   // nothing measurable yet; the poller comes back
+    const v = validateView(raw), text = canonical(v);
     if (text === last && !force) return pending;
     const sem = semantic(v), push = last && sem !== lastSemantic;
     last = text; lastSemantic = sem; candidate = text;
@@ -101,7 +103,11 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
     pending = (async () => {
       try {
         const res = await fetch('/api/permalinks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: text });
-        if ((res.status === 404 || res.status === 405) && !inlineFailed) { snapshotsAbsent = true; if (generation === stamp) notice(''); return; }
+        // 403 belongs here with 404/405: GitHub Pages serves the site under a
+        // sub-path and answers 403 — not 404 — for /api/… above it. Without
+        // this the latch never sets, so every large view retries a POST that
+        // cannot succeed and shows a notice for a service that is simply absent.
+        if ([403, 404, 405].includes(res.status) && !inlineFailed) { snapshotsAbsent = true; if (generation === stamp) notice(''); return; }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { id } = await res.json();
         if (id !== await viewDigest(v)) throw new Error('snapshot identifier mismatch');
@@ -123,7 +129,8 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
       const view = await read();
       if (view) await restore(view);
       blocked = false;
-      last = canonical(capture()); lastSemantic = semantic(capture()); candidate = last;
+      const snap = capture();
+      last = snap ? canonical(snap) : ''; lastSemantic = snap ? semantic(snap) : ''; candidate = last;
       if (!view) last = '';
     } catch (err) { blocked = true; notice(`Could not restore link: ${err.message}. Use “New view” to leave this link.`); }
     finally { restoring = false; onHistory(); }
@@ -138,7 +145,9 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
   setInterval(() => {
     if (!ready || restoring || blocked || pointerActive || document.querySelector('.dragging, .detail-resizing')) return;
     try {
-      const now = canonical(capture());
+      const snap = capture();
+      if (!snap) return;
+      const now = canonical(snap);
       if (now !== candidate) { candidate = now; since = performance.now(); }
       else if (now !== last && performance.now() - since > 180) void flush().catch(err => notice(err.message));
     } catch (err) { notice(err.message); }
@@ -146,9 +155,16 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
   return {
     get ready() { return ready; }, get restoring() { return restoring; },
     get canBack() { return (history.state?.cwDepth || 0) > 0; },
-    async start() { await load(); ready = true; if (!blocked) await flush(); },
+    async start() {
+      await load(); ready = true;
+      // The boot flush is guarded like every other call site. Before this, it
+      // was the only place a capture/validation failure could escape, and it
+      // escaped into `await links.start()` — killing the caller's remaining
+      // setup and leaving an unhandled rejection with no way back.
+      if (!blocked) try { await flush(); } catch (err) { notice(err.message); }
+    },
     flush,
-    async copy() { await flush(true); if (blocked) throw new Error('Restore the link or choose New view first'); if (canonical(await read()) !== canonical(capture())) throw new Error('The view changed or could not be saved. Try Copy link again.'); await navigator.clipboard.writeText(location.href); notice('View link copied'); },
+    async copy() { await flush(true); if (blocked) throw new Error('Restore the link or choose New view first'); const snap = capture(); if (!snap || canonical(await read()) !== canonical(snap)) throw new Error('The view changed or could not be saved. Try Copy link again.'); await navigator.clipboard.writeText(location.href); notice('View link copied'); },
     back() { if (this.canBack) history.back(); },
     newView() { blocked = false; last = ''; generation++; history.replaceState({ cwDepth: 0 }, '', location.pathname); void flush(); },
   };
