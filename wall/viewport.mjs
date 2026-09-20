@@ -79,17 +79,40 @@ export class Viewport {
       this._transition = 0;
       this.canvas.style.transition = ms ? `transform ${Math.round(ms)}ms ${ZOOM_EASE}` : 'none';
       if (ms) this.settlesAt = Math.max(this.settlesAt, now + ms);
+      // Measure the stage BEFORE writing the transform. A rect read after the
+      // write forces style recalculation on every frame of a gesture; read
+      // first, the frame's layout is already clean and the read is free. The
+      // rect is handed to onChange so it need not measure again.
+      const rect = this.stage.getBoundingClientRect();
       // Keep the canvas strictly 2D: Chrome cannot pick a raster scale for a
       // layer whose screen transform has perspective and falls back to full
       // world resolution, which is hundreds of MB for this many tiles.
       this.canvas.style.transform = `translate3d(${this.x.toFixed(2)}px, ${this.y.toFixed(2)}px, 0) scale(${this.scale.toFixed(4)})`;
       this.mirror?.({ x: this.x, y: this.y, scale: this.scale }, this.canvas.style.transition);
-      this.onChange(this);
+      this.onChange(this, rect);
     });
   }
 
   /** Land any transition now: the next write is immediate. */
   _cancelZoom() { this._transition = 0; this.settlesAt = 0; }
+
+  /** Read compositor motion when interrupting an eased action. Direct gesture
+   * deltas may share a pending frame; their accumulated input pose is already
+   * authoritative and must not be replaced by the preceding painted frame. */
+  visiblePose() {
+    if (!this._transition && performance.now() >= this.settlesAt) return this.snapshot();
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(this.canvas).transform);
+    return { x: matrix.e, y: matrix.f, scale: matrix.a, fitted: this.fitted };
+  }
+
+  interrupt() {
+    const pose = this.visiblePose();
+    this._cancelZoom();
+    this.x = pose.x; this.y = pose.y; this.scale = pose.scale;
+    this.canvas.style.transition = 'none';
+    this.canvas.style.transform = `translate3d(${pose.x}px, ${pose.y}px, 0) scale(${pose.scale})`;
+    return pose;
+  }
 
   setContent(w, h, items = []) {
     this.resetEdge(); this._cancelZoom();
@@ -155,6 +178,7 @@ export class Viewport {
   }
 
   _pan(dx, dy, { drag = false, point = null } = {}) {
+    if (this._transition || performance.now() < this.settlesAt) this.interrupt();
     if (this.panMode === 'free' || !this.bounds) {
       this._set(this.x + dx, this.y + dy, this.scale);
       return;
@@ -189,15 +213,16 @@ export class Viewport {
     // Keep the canvas point under the cursor pinned across the scale change.
     // `scale` is already the landing value of any transition in flight, so
     // rapid ticks compose onto one target and the compositor eases between.
-    const cx = (px - this.x) / this.scale;
-    const cy = (py - this.y) / this.scale;
+    const visible = this.visiblePose();
+    const cx = (px - visible.x) / visible.scale;
+    const cy = (py - visible.y) / visible.scale;
     // Zooming out stops at Fit of what there is to show: a canvas of empty space says nothing.
     const floor = Math.max(MIN_SCALE, Math.min(this.scale, this.scaleFloor?.() ?? MIN_SCALE));
     const next = Math.min(MAX_SCALE, Math.max(floor, this.scale * factor));
     let view = { x: px - cx * next, y: py - cy * next, scale: next };
     if (this.panMode !== 'free' && this.bounds) view = boundPan(view, { w: r.width, h: r.height }, this.bounds);
     this._transition = reducedMotion() ? 0 : duration;
-    if (!duration) this._cancelZoom(); // a pinch frame must land now, not ease
+    if (!duration || reducedMotion()) this._cancelZoom(); // direct pinch/reduced motion lands now
     this._set(view.x, view.y, view.scale);
   }
 
@@ -206,7 +231,9 @@ export class Viewport {
     const [a, b] = [...this._touches.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y), mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     if (this._pinch && this._pinch.dist > 0) {
-      this.zoomAt(mid.x, mid.y, dist / this._pinch.dist, { duration: 0 });
+      // Scale around the previous anchor, then carry it to the new midpoint.
+      // Scaling around the new midpoint first would count its travel twice.
+      this.zoomAt(this._pinch.mid.x, this._pinch.mid.y, dist / this._pinch.dist, { duration: 0 });
       this._pan(mid.x - this._pinch.mid.x, mid.y - this._pinch.mid.y);
     }
     this._pinch = { dist, mid };
@@ -216,6 +243,7 @@ export class Viewport {
   panTo(x, y, { duration = ZOOM_MS.button } = {}) {
     this.resetEdge();
     this._transition = reducedMotion() ? 0 : duration;
+    if (!duration || reducedMotion()) this._cancelZoom();
     this._set(x, y, this.scale);
   }
 
@@ -256,7 +284,7 @@ export class Viewport {
   animateTo(x, y, scale, { duration = ZOOM_MS.button } = {}) {
     this.resetEdge();
     this._transition = reducedMotion() ? 0 : duration;
-    if (!duration) this._cancelZoom();
+    if (!duration || reducedMotion()) this._cancelZoom();
     this._set(x, y, scale);
   }
 
@@ -297,7 +325,7 @@ export class Viewport {
       // open. Capture is taken lazily in pointermove, once the gesture has
       // proven itself a drag.
       // Controls overlaid on the stage (undo, row title) are not gesture starts.
-      if (e.target.closest?.('.edge-undo, .row-title, .review-tip')) return;
+      if (e.target.closest?.('.edge-undo, .row-title, .review-tip, .tray-return, .tray-filter, .group-filter')) return;
       if (e.pointerType === 'touch') {
         this._touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
         if (this._touches.size === 2) {

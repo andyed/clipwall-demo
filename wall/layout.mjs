@@ -15,8 +15,21 @@ const DEFAULTS = { targetH: 240, gap: 14, headerH: 52, blockGap: 64 };
 /** Height of a group block's heading band, in world units. */
 export const HEADER_H = DEFAULTS.headerH;
 
-/** Fall back to 4:3 when a clip has no usable intrinsic dimensions. */
+/**
+ * Fall back to 4:3 when a clip has no usable intrinsic dimensions.
+ *
+ * Memoised per clip object: layout() tries 25 candidate widths and each asks
+ * for every clip's aspect several times, so at 1,800 clips this regex ran
+ * ~150,000 times per render. A clip's dims do not change under the wall; a
+ * replaced clip is a new object and misses the cache.
+ */
+const aspects = new WeakMap();
 function aspectOf(clip) {
+  let a = aspects.get(clip);
+  if (a === undefined) { a = computeAspect(clip); if (clip && typeof clip === 'object') aspects.set(clip, a); }
+  return a;
+}
+function computeAspect(clip) {
   const dim = String(clip.props?.dims?.[0] || clip.props?.dims || '');
   const m = dim.match(/^(\d+)x(\d+)$/);
   if (m) {

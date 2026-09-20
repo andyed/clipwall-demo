@@ -14,6 +14,47 @@ export function createDetailPane(panel, stage) {
   content.className = 'detail-content';
   panel.append(handle, content);
   panel.inert = true;
+  let opened = false;
+  let lastFocusLabel = null;
+  const outsideInert = new Map();
+  const controls = () => [...panel.querySelectorAll('button, a[href], [tabindex="0"]')]
+    .filter(node => node.checkVisibility() && !node.disabled);
+  panel.addEventListener('focusin', event => {
+    lastFocusLabel = event.target.getAttribute('aria-label');
+  });
+  const syncAccess = () => {
+    const modal = opened && window.innerWidth <= 800;
+    if (modal) {
+      // The entire application outside the full-screen reader is unavailable,
+      // including toolbar/rail controls. Restore each previous value on exit.
+      for (const node of document.body.children) {
+        if (node === panel || node.contains(panel)) continue;
+        if (!outsideInert.has(node)) outsideInert.set(node, node.inert);
+        node.inert = true;
+      }
+    } else {
+      for (const [node, inert] of outsideInert) node.inert = inert;
+      outsideInert.clear();
+    }
+    panel.setAttribute('role', modal ? 'dialog' : 'complementary');
+    if (modal) panel.setAttribute('aria-modal', 'true'); else panel.removeAttribute('aria-modal');
+    // Next/Previous replaces the content, so its former focused button no
+    // longer exists. Continue from the equivalent control in the new reader.
+    if (modal && !panel.contains(document.activeElement)) {
+      const available = controls();
+      (available.find(node => lastFocusLabel && node.getAttribute('aria-label') === lastFocusLabel)
+        || content.querySelector('button') || available[0])?.focus({ preventScroll: true });
+    }
+  };
+  window.addEventListener('resize', syncAccess);
+  panel.addEventListener('keydown', e => {
+    if (!opened || window.innerWidth > 800 || e.key !== 'Tab') return;
+    const available = controls();
+    if (!available.length) return;
+    const first = available[0], last = available.at(-1);
+    if (e.shiftKey && (document.activeElement === first || !panel.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
 
   const bounds = () => {
     const width = window.innerWidth;
@@ -71,17 +112,22 @@ export function createDetailPane(panel, stage) {
   return {
     content,
     open() {
+      opened = true;
       panel.inert = false;
       panel.classList.add('open');
       document.body.classList.add('detail-open');
       content.scrollTop = 0;
       announceSize();
+      syncAccess();
     },
     close() {
+      opened = false;
       stop();
       panel.inert = true;
       panel.classList.remove('open');
       document.body.classList.remove('detail-open');
+      syncAccess();
+      lastFocusLabel = null;
     },
   };
 }

@@ -233,6 +233,9 @@ html, body {
 }
 .stage.dragging { cursor: grabbing; }
 .stage.full { left: 0; }
+.tray-return { position: absolute; left: 12px; bottom: 12px; z-index: 8; min-width: 44px; min-height: 44px; background: var(--panel); }
+.tray-filter { position: absolute; left: 64px; bottom: 12px; z-index: 8; min-width: 44px; min-height: 44px; background: var(--panel); }
+.stage:has(.tray-return:not([hidden])) .edge-undo { left: 116px; }
 
 .canvas {
   position: absolute;
@@ -252,10 +255,15 @@ html, body {
   border-radius: 5px;
   background: var(--panel-2);
   border: 1px solid rgba(255, 255, 255, 0.09);
-  transition: transform 0.28s cubic-bezier(0.22, 0.7, 0.2, 1),
-              width 0.28s cubic-bezier(0.22, 0.7, 0.2, 1),
-              height 0.28s cubic-bezier(0.22, 0.7, 0.2, 1),
-              opacity 0.2s linear;
+  /* layout-motion.mjs bounds position/scale animation to visible cards.
+   * A width/height transition is a layout on every
+   * frame for every tile that changed shape — at 1,800 tiles a filter change
+   * held the wall at 30 fps for the whole 280 ms and cost three times the
+   * layout work of the slide alone. Transform is compositor-only. */
+  transition: opacity 0.2s linear;
+  /* Each tile is a fixed box whose contents cannot affect anything outside it,
+   * so its layout and paint can be resolved in isolation. */
+  contain: layout paint style;
   cursor: pointer;
 }
 .tile:hover { border-color: rgb(var(--accent-rgb)); }
@@ -408,7 +416,8 @@ body {
   --detail-size: clamp(320px, var(--detail-preferred, 40vw), max(320px, calc(100vw - var(--detail-context))));
 }
 body:has(.stage.full) { --detail-context: 240px; }
-body.detail-open .stage { right: var(--detail-size); }
+/* The reader lifts over the desk. Its width never repacks the collection. */
+body.detail-open .stage { right: 0; }
 body.detail-open .hint { right: calc(var(--detail-size) + 12px); }
 body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; user-select: none !important; }
 
@@ -424,10 +433,12 @@ body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; us
   overflow: hidden;
   z-index: 18;
   transform: translateX(100%);
-  transition: transform 0.24s ease;
+  opacity: 0;
+  transition: opacity 0.14s ease;
 }
-.detail.open { transform: none; }
-.detail-content { height: 100%; overflow-y: auto; overflow-wrap: anywhere; padding: 20px 20px 20px 24px; }
+.detail.open { transform: none; opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .detail { transition: none; } }
+.detail-content { height: 100%; overflow-y: auto; overflow-wrap: anywhere; padding: 20px 20px 20px 24px; touch-action: pan-y; }
 .detail-resize { position: absolute; inset: 0 auto 0 0; width: 12px; z-index: 2; cursor: col-resize; touch-action: none; }
 .detail-resize::after { content: ''; position: absolute; left: 3px; top: calc(50% - 32px); height: 64px; width: 3px; border-radius: 3px; background: var(--muted); }
 .detail-resize:hover::after, .detail-resize:focus-visible::after { background: var(--accent-text); }
@@ -601,11 +612,14 @@ body.has-scope { --scope-h: 60px; }
  * screen-space title names the group under the viewport. It drifts at a third
  * of pan speed (parallax), is pushed off by the next group's edge like a sticky
  * header, and steps between groups on click. Never part of layout or scope. */
-.row-title { position: absolute; top: 10px; left: 0; height: 36px; z-index: 6; display: inline-flex; align-items: stretch; background: var(--scrim); border: 1px solid rgba(var(--accent-rgb), 0.35); border-radius: 6px; color: var(--accent-text); white-space: nowrap; transition: transform 0.18s ease; }
+.row-title { position: absolute; top: 10px; left: 0; height: 44px; max-width: calc(100% - 24px); z-index: 6; display: inline-flex; align-items: stretch; background: var(--scrim); border: 1px solid rgba(var(--accent-rgb), 0.35); border-radius: 6px; color: var(--accent-text); white-space: nowrap; transition: transform 0.18s ease; }
 .row-title[hidden] { display: none; }
 .row-title[data-layer="context"] { border-style: dashed; } /* naming a group on the context plane */
 .row-title button { background: transparent; border: 0; color: inherit; font: 700 15px/1 inherit; font-family: inherit; letter-spacing: 0.01em; cursor: pointer; display: inline-flex; align-items: center; gap: 10px; padding: 0 12px; }
-.row-title .rt-focus { padding-left: 14px; }
+.row-title .rt-focus { padding-left: 14px; min-width: 0; overflow: hidden; }
+.row-title .rt-focus strong { overflow: hidden; text-overflow: ellipsis; }
+.row-title button { min-width: 44px; flex-shrink: 0; }
+.row-title .rt-focus { flex-shrink: 1; }
 .row-title .rt-next { font-size: 20px; border-left: 1px solid rgba(var(--accent-rgb), 0.25); }
 .row-title .n, .row-title .pos { color: var(--muted); font-weight: 500; font-size: 13px; font-variant-numeric: tabular-nums; }
 .row-title button:hover { background: rgba(var(--accent-rgb), 0.12); }
@@ -680,7 +694,7 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
   .stage, .stage.full { left: 0; }
   .scope-bar, body:has(.stage.full) .scope-bar { left: 0; }
   .rail { top: var(--bar-h); left: 0; width: min(340px, 88vw); z-index: 18; box-shadow: 12px 0 32px rgba(0, 0, 0, 0.55); }
-  .row-title { top: 8px; height: 34px; }
+  .row-title { top: 8px; height: 44px; }
   .row-title button { font-size: 14px; padding: 0 10px; }
 }
 /* Hover-only affordances go with the pointer, not the width: a narrow window on

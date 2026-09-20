@@ -77,6 +77,35 @@ function proxied(src) {
   return `/api/proxy?url=${encodeURIComponent(src)}`;
 }
 
+/**
+ * The clip's image source for a target pixel size: the smallest cover variant
+ * at least that wide, else the largest there is, else the plain cover. The
+ * far tier's 64 px slot takes a 128 px derivative and the near tier's 256 px
+ * slot a 640 px one, instead of both downscaling the same file.
+ */
+function sourceFor(clip, px) {
+  const variants = (Array.isArray(clip?.coverVariants) ? clip.coverVariants : [])
+    .filter(v => typeof v?.src === 'string' && Number.isFinite(v.width) && v.width > 0)
+    .sort((a, b) => a.width - b.width);
+  const fit = variants.find(v => v.width >= px) || variants.at(-1);
+  return fit?.src || clip?.cover || clip?.media?.[0]?.src || null;
+}
+
+/**
+ * One axis of the pan rule: `a` and `b` are the camera centres that put the
+ * content's near and far edge at the pane's edge (with `half` the visible
+ * half-extent). Overflowing content (a ≤ b) may be panned between them;
+ * fitting content (a > b) is frozen unless part of it is off the pane.
+ */
+function clampPan(current, next, lo, hi, half) {
+  const a = lo + half, b = hi - half;
+  const clamp = (v, l, h) => Math.max(l, Math.min(h, v));
+  if (a <= b) return clamp(next, a, b);
+  if (current > a) return clamp(next, a, current);   // the near edge is clipped: may return, not go on
+  if (current < b) return clamp(next, current, b);   // the far edge is clipped: likewise
+  return current;                                     // fully visible: nothing to reveal
+}
+
 export class SpatialView {
   /**
    * @param {HTMLElement} host element to mount into
@@ -86,13 +115,19 @@ export class SpatialView {
    * @param {() => void} [hooks.onHoverEnd]  the pointer has left every item
    * @param {() => boolean} [hooks.hoverEnabled]  asked BEFORE each pick, so a
    *   field nobody is previewing costs nothing
+   * @param {() => void} [hooks.onInteraction] invalidate parent preview intent
    */
-  constructor(host, { onOpen, onHover, onHoverEnd, hoverEnabled } = {}) {
+  constructor(host, { onOpen, onHover, onHoverEnd, hoverEnabled, onInteraction } = {}) {
     this.host = host;
     this.onOpen = onOpen || (() => {});
     this.onHover = onHover || (() => {});
     this.onHoverEnd = onHoverEnd || (() => {});
     this.hoverEnabled = hoverEnabled || (() => false);
+    this.onInteraction = onInteraction || (() => {});
+    this._cameraMotion = null;
+    this._returnPose = null;
+    this._hoverCandidate = -1;
+    this._hoverTimer = 0;
     this._hovered = -1;
     this._hoverFrame = 0;
     this.clips = [];
@@ -158,6 +193,10 @@ export class SpatialView {
       onTypeAhead: (prefix) => this._jumpPile(prefix),
     });
 
+    // Selection promotes a card and repositions it outside the frame loop,
+    // so it must invalidate the on-demand frame (focus is wrapped per field).
+    const select = this.nav.select.bind(this.nav);
+    this.nav.select = (i) => { select(i); this.invalidate(); };
     const selectFirst = this.nav.selectFirstVisible.bind(this.nav);
     this.nav.selectFirstVisible = () => {
       if (this.mode !== 'piles' || !this.piles.piles.length) return selectFirst();
@@ -178,30 +217,49 @@ export class SpatialView {
     // whose image is simply dark — so the counts have to be reachable.
     window.__cwSpatial = this;
 
+    // Render on demand. A stationary camera over a settled field has nothing
+    // new to draw, and drawing it anyway cost 18% of a core and a full tier
+    // pass over every instance, every frame, while the view sat idle. The
+    // loop keeps ticking (cheap) but does the CPU passes and the two renders
+    // only when something moved: the camera, an animating instance, the pane,
+    // a tile landing in an atlas, a hover or selection, or any explicit
+    // invalidate(). Anything that changes what the field shows must call
+    // invalidate(); the lib's takeDirty() covers its own mutations.
     let last = performance.now();
+    const seen = { pos: new THREE.Vector3(NaN, NaN, NaN), look: new THREE.Vector3(NaN, NaN, NaN), w: 0, h: 0 };
     const frame = (now) => {
       const dt = Math.min(100, now - last); last = now;
       if (!this.host.hidden) {
-        this.camera.position.copy(this.basePos);
-        this.camera.lookAt(this.lookTarget);
-        this.camera.updateMatrixWorld();
-        this.field.tick(dt);
-        // Spend the near atlas on exposed covers / the open stack before
-        // hidden members. Otherwise late-month covers get stuck at 64px.
-        const readable = this.mode === 'piles'
-          ? (this.piles.spreadPile >= 0 ? this.piles.piles[this.piles.spreadPile].indices
-            : this.piles.piles.flatMap((_, i) => this.piles.faceOf(i))) : [];
-        for (const i of readable) this.field.atlases.request(i, 'near', now);
-        this.field.update(this.camera, now);
-        this.hybrid.update(this.camera);
-        this.hybrid.sort(this.camera);
-        // Keep group names readable and steady at every zoom level.
-        const focal = this.host.clientHeight / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)));
-        for (const label of this.labelObjs) label.scale.setScalar(
-          (this.camera.position.z - label.position.z) / focal * 0.55);
-
-        this.webglRenderer.render(this.scene, this.camera);
-        this.cssRenderer.render(this.scene, this.camera);
+        this._tickCamera(now);
+        const w = this.host.clientWidth, h = this.host.clientHeight;
+        const moved = !seen.pos.equals(this.basePos) || !seen.look.equals(this.lookTarget) || seen.w !== w || seen.h !== h;
+        const moving = this.field.tick(dt) > 0;
+        if (moved || moving || this._dirty) {
+          seen.pos.copy(this.basePos); seen.look.copy(this.lookTarget); seen.w = w; seen.h = h;
+          this._dirty = false;
+          this.camera.position.copy(this.basePos);
+          this.camera.lookAt(this.lookTarget);
+          this.camera.updateMatrixWorld();
+          // Spend the near atlas on exposed covers / the open stack before
+          // hidden members. Otherwise late-month covers get stuck at 64px.
+          const readable = this.mode === 'piles'
+            ? (this.piles.spreadPile >= 0 ? this.piles.piles[this.piles.spreadPile].indices
+              : this.piles.piles.flatMap((_, i) => this.piles.faceOf(i))) : [];
+          for (const i of readable) this.field.atlases.request(i, 'near', now);
+          this.field.update(this.camera, now);
+          this.hybrid.update(this.camera);
+          this.hybrid.sort(this.camera);
+          // Keep group names readable and steady at every zoom level.
+          const focal = h / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)));
+          for (const label of this.labelObjs) label.scale.setScalar(
+            (this.camera.position.z - label.position.z) / focal * 0.55);
+          this.field.takeDirty();
+          this._render();
+        } else if (this.field.flush(now) || this.field.takeDirty()) {
+          // Nothing moved, but a tile landed (or the lib changed an attribute):
+          // draw the new pixels, skip the passes.
+          this._render();
+        }
       }
       requestAnimationFrame(frame);
     };
@@ -215,6 +273,15 @@ export class SpatialView {
     this._observer.observe(this.host);
   }
 
+  _render() {
+    this.webglRenderer.render(this.scene, this.camera);
+    this.cssRenderer.render(this.scene, this.camera);
+    this.renders = (this.renders || 0) + 1;   // for the perf harness: idle must not count
+  }
+
+  /** Something outside the lib's knowledge changed what the frame shows. */
+  invalidate() { this._dirty = true; }
+
   /**
    * Numeric indices belong to one clip snapshot. The mesh, both atlases, DOM
    * pool, piles, and selection must retire together before those indices can
@@ -222,6 +289,7 @@ export class SpatialView {
    * replace only the data-dependent resources, using their public disposers.
    */
   _replaceField() {
+    this._dirty = true;
     this.hybrid?.dispose();
     this.field?.dispose();
     this.cardHost?.dispose();
@@ -272,10 +340,8 @@ export class SpatialView {
       count: Math.max(1, clips.length),
       nearDistance: 3200,
       nearSlots: 256,
-      resolve: (i) => {
-        const clip = clips[i];
-        const src = clip?.cover || clip?.media?.[0]?.src || null;
-        // Both tiers use the captured file until capture has a thumb ladder.
+      resolve: (i, tier) => {
+        const src = sourceFor(clips[i], tier === 'near' ? 256 : 64);
         return src ? proxied(src) : null;
       },
       // Near tier only. The far atlas is the whole corpus resident at once, and
@@ -296,6 +362,8 @@ export class SpatialView {
     this.field.count = clips.length;
     this.field.mesh.count = clips.length;
     this.field.setMotion(this.motion);
+    // Per-slot atlas uploads instead of the whole canvas per flush (atlas.js).
+    this.field.setRenderer(this.webglRenderer);
 
     this.piles = new PileLayout({
       field: this.field, surface: this.surface, maxVisibleInPile: 8,
@@ -304,12 +372,13 @@ export class SpatialView {
     this.hybrid = new HybridField({
       scene: this.scene, field: this.field,
       poolSize: 14, basePx: 340, promoteDistance: 0,
-      eligible: (i) => this.mode !== 'piles' || (this.piles.spreadPile < 0 && this._pileTops?.has(i)),
+      eligible: (i) => this._domEligible(i),
       className: 'sp-card', idPrefix: 'sp-card',
       build: (i, el) => this._buildCard(i, el),
       onActivate: (i) => this._activate(i),
     });
     this._bindCardHover();
+    { const setFocus = this.hybrid.setFocus.bind(this.hybrid); this.hybrid.setFocus = (i) => { setFocus(i); this.invalidate(); }; }
     if (this.nav) {
       this.nav.field = this.field;
       this.nav.hybrid = this.hybrid;
@@ -356,7 +425,7 @@ export class SpatialView {
     const clip = this.clips[i];
     if (!clip) return;
 
-    const src = clip.cover || clip.media?.[0]?.src || '';
+    const src = sourceFor(clip, 340) || '';   // the card is authored 340 px wide
     if (src) {
       const img = document.createElement('img');
       img.className = 'sp-thumb';
@@ -428,12 +497,11 @@ export class SpatialView {
         const clip = this._hoverTarget(entry.index);
         if (!clip) return;
         if (this._hoverFrame) { cancelAnimationFrame(this._hoverFrame); this._hoverFrame = 0; }
-        this._hovered = entry.index;
-        this.onHover(clip);
+        this._queueHover(entry.index);
       });
       entry.el.addEventListener('pointerleave', (e) => {
         if (e.pointerType === 'touch') return;
-        if (entry.index >= 0 && entry.index === this._hovered) this._endHover();
+        if (entry.index >= 0 && (entry.index === this._hovered || entry.index === this._hoverCandidate)) this._endHover();
       });
     }
   }
@@ -445,13 +513,30 @@ export class SpatialView {
     if (!r.width || !r.height) return;
     const hit = this.field.pickAt(((clientX - r.left) / r.width) * 2 - 1,
       -((clientY - r.top) / r.height) * 2 + 1, this.camera);
-    if (hit === this._hovered) return;              // same item, nothing to say
+    if (hit === this._hovered && this._hoverCandidate < 0) return; // same settled item
     const clip = hit >= 0 ? this._hoverTarget(hit) : null;
-    this._hovered = clip ? hit : -1;
-    if (clip) this.onHover(clip); else this.onHoverEnd();
+    if (clip) this._queueHover(hit); else this._endHover();
   }
 
+  _queueHover(index) {
+    if (this._cameraMotion || index === this._hovered || index === this._hoverCandidate) return;
+    this._endHover();
+    this._hoverCandidate = index;
+    this._hoverTimer = setTimeout(() => {
+      this._hoverTimer = 0; this._hoverCandidate = -1;
+      if (!this.hoverEnabled() || this._cameraMotion) return;
+      const clip = this._hoverTarget(index);
+      if (clip) { this._hovered = index; this.onHover(clip); }
+    }, 120);
+  }
+
+  /** Only a fresh pointer move may establish intent after camera/layout work. */
+  cancelHover() { this._endHover(); }
+
+  _notifyInteraction() { this.cancelHover(); this.onInteraction(); }
+
   _endHover() {
+    clearTimeout(this._hoverTimer); this._hoverTimer = 0; this._hoverCandidate = -1;
     if (this._hoverFrame) { cancelAnimationFrame(this._hoverFrame); this._hoverFrame = 0; }
     if (this._hovered === -1) return;
     this._hovered = -1;
@@ -473,18 +558,24 @@ export class SpatialView {
   }
 
   _activate(i) {
+    this._notifyInteraction();
     if (this.mode === 'piles') {
       const pile = this.piles.pileOf(i);
       if (pile >= 0 && this.piles.spreadPile !== pile) {
         this.hybrid.setFocus(-1);
-        if (this.piles.spreadPile >= 0) this._collapsePile(this.piles.spreadPile);
+        if (this.piles.spreadPile < 0) {
+          this._returnPose = this._cameraPose();
+          this._returnBox = this._box?.clone();
+          this._returnLabels = this.labelObjs.map(label => label.position.clone());
+        }
+        if (this.piles.spreadPile >= 0) this._collapsePile(this.piles.spreadPile, { animate: true });
         this.piles.spread(pile, { columns: Math.max(1, Math.round(Math.sqrt(
           this.piles.piles[pile].indices.length * this.camera.aspect / 1.5))) });
         // Browsing an open stack uses the existing justified layout so mixed
         // image proportions fill the pane without overlapping their neighbours.
-        this._spread(pile);
+        const corners = this._spread(pile, { animate: true });
         this._labels();
-        this.fit(this.piles.piles[pile].indices);
+        this.fit(this.piles.piles[pile].indices, { animate: true, corners });
         return;
       }
     }
@@ -498,18 +589,49 @@ export class SpatialView {
    * Show a filtered set. Called with whatever the facet rail has narrowed to,
    * so the spatial view and the flat wall always agree about what is in scope.
    */
-  setClips(clips, groupKey = 'none') {
-    // Include content, not just ids: an editor may retitle a note or change
-    // its cover without changing its id/URL, including by mutating an object
-    // already supplied here. A stored value snapshot detects that too.
-    const snapshot = JSON.stringify(clips);
-    const replace = this.built && snapshot !== this._clipSnapshot;
-    this.clips = clips;
+  setClips(clips, groupKey = 'none', { corpus = null, revision = null } = {}) {
+    // Two ways to be called. With a `corpus` (the app: the whole clip index
+    // and its server revision), the field is allocated for the corpus once
+    // and `clips` is MEMBERSHIP — a filter change is a mask over resident
+    // instances, never a rebuild. Without one (fixtures, older callers) the
+    // clips are the corpus, and content, not just ids, decides whether it
+    // changed: an editor may retitle a note or change its cover without
+    // changing its id/URL, including by mutating an object already supplied.
+    this._returnPose = null;
+    this._notifyInteraction();
+    const all = corpus || clips;
+    const snapshot = revision !== null ? `rev:${revision}:${all.length}` : JSON.stringify(all);
+    const replace = this.built && (snapshot !== this._clipSnapshot || all !== this.clips);
+    this.clips = all;
     this.groupKey = groupKey;
     this._ensureScene();
     if (replace) this._replaceField();
     this._clipSnapshot = snapshot;
+    if (replace || !this._indexOf) this._indexOf = new Map(all.map((clip, i) => [clip, i]));
+    this._setMembership(corpus ? clips.map(clip => this._indexOf.get(clip)).filter(i => i !== undefined) : all.map((_, i) => i));
+    this._show();
+  }
 
+  /** Which corpus indices are in scope. Everything else is hidden in place. */
+  _setMembership(indices) {
+    this.active = indices;
+    const inScope = new Set(indices);
+    for (let i = 0; i < this.field.count && i < this.clips.length; i++) this.field.setActive(i, inScope.has(i));
+    if (this.nav && this.nav.selection >= 0 && !inScope.has(this.nav.selection)) {
+      // A filtered-out selection is no selection.
+      this.hybrid.setFocus(-1);
+      this.nav.selection = -1;
+      this.nav.container.removeAttribute('aria-activedescendant');
+    }
+    this._dirty = true;
+  }
+
+  /** Lay the in-scope field out flat and frame it. */
+  _show() {
+    this._returnPose = null;
+    this._notifyInteraction();
+    if (this._trayRim) this._trayRim.visible = false;
+    if (this.piles.spreadPile >= 0) this._collapsePile(this.piles.spreadPile);
     this.hybrid.promoteDistance = 0;
     this.mode = 'mountain'; // retained version-1 view-state name for the field
     this._generatedPiles = false;
@@ -523,15 +645,17 @@ export class SpatialView {
   }
 
   _placeField() {
-    const result = this._composition(this.clips);
-    result.tiles.forEach((t, i) => {
+    const active = this.active || [];
+    const result = this._composition(active.map(i => this.clips[i]));
+    result.tiles.forEach((t, k) => {
+      const i = active[k];
       this.field.place(i, t.x + t.w / 2, -t.y - t.h / 2, 0, t.w, t.h);
       this.field.setRow(i, 0);
     });
     this.field.layout();
   }
 
-  _spread(index) {
+  _spread(index, { animate = false } = {}) {
     { const p = this.piles.piles[index]; if (p?.all) p.indices = p.all; } // a spread shows every member, shared ones included
     const pile = this.piles.piles[index];
     const result = this._composition(pile.indices.map(i => this.clips[i]));
@@ -541,8 +665,26 @@ export class SpatialView {
         pile.v - t.y - t.h / 2 + result.height / 2, 140, t.w, t.h, new THREE.Quaternion());
       this.field.setRow(i, 0);
     });
-    for (const i of pile.indices) this.field.settle(i);
+    if (!animate || this._reducedMotion()) for (const i of pile.indices) this.field.settle(i);
+    this._spreadMembers = new Set(pile.indices);
+    this._spreadExtent = { x: pile.u, top: pile.v + result.height / 2 };
+    // A shallow, non-interactive rim keeps the open tray legible as a place.
+    // It never takes a card's hit target or changes collection membership.
+    if (!this._trayRim) {
+      this._trayRim = new THREE.LineLoop(new THREE.BufferGeometry(),
+        new THREE.LineBasicMaterial({ color: 0x8fd9ff, transparent: true, opacity: 0.42 }));
+      this.scene.add(this._trayRim);
+    }
+    const x0 = pile.u - result.width / 2 - 12, x1 = pile.u + result.width / 2 + 12;
+    const y0 = pile.v - result.height / 2 - 12, y1 = pile.v + result.height / 2 + 12;
+    this._trayRim.geometry.dispose();
+    this._trayRim.geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(x0, y0, 139), new THREE.Vector3(x1, y0, 139),
+      new THREE.Vector3(x1, y1, 139), new THREE.Vector3(x0, y1, 139)]);
+    this._trayRim.visible = true;
     this.field.layout();
+    return [new THREE.Vector3(pile.u - result.width / 2, pile.v - result.height / 2, 140),
+      new THREE.Vector3(pile.u + result.width / 2, pile.v + result.height / 2, 140)];
   }
 
   _packPiles() {
@@ -558,13 +700,21 @@ export class SpatialView {
     this._labels();
   }
 
-  _collapsePile(index) {
+  _collapsePile(index, { animate = false } = {}) {
     const pile = this.piles.piles[index];
-    const borrowed = !!pile?.exclusive && pile.indices !== pile.exclusive;
+    const borrowed = !!pile?.exclusive && pile.indices.length !== pile.exclusive.length;
+    const owned = borrowed ? new Set(pile.exclusive) : null;
+    const borrowedMembers = borrowed ? new Set(pile.indices.filter(i => !owned.has(i))) : null;
+    const owners = borrowed ? this.piles.piles.map((p, i) => ({ p, i })).filter(({ p, i }) =>
+      i !== index && (p.exclusive || p.indices).some(member => borrowedMembers.has(member))) : [];
+    // Compute canonical collapsed geometry once, then move from the visible
+    // pose. Borrowed members return to their own tray in the same transition.
+    const affected = [...pile.indices, ...owners.flatMap(({ p }) => p.exclusive || p.indices)];
+    const starts = animate && !this._reducedMotion() ? new Map([...new Set(affected)].map(i => [i, this._placement(i)])) : null;
     if (pile?.exclusive) pile.indices = pile.exclusive; // give shared members back to their own piles
     this.piles.collapse(index, true);
     // Shared members the spread borrowed were moved; their owning piles re-place them.
-    if (borrowed) for (let i = 0; i < this.piles.piles.length; i++) if (i !== index) this.piles.collapse(i, true);
+    for (const { i } of owners) this._collapsePile(i);
     // A stack has a stable cover footprint. Contain banners/portraits within
     // it, retaining proportions; expanding reveals each image at full size.
     // Face members are already contained in their cells by the layout.
@@ -578,23 +728,46 @@ export class SpatialView {
       this.field.moveTo(i, c.x, c.y, c.z, w * scale, h * scale, q);
       this.field.settle(i);
     }
+    if (starts) for (const [i, from] of starts) {
+      const to = this._placement(i);
+      this.field.place(i, ...from.position, ...from.size, from.rotation);
+      this.field.moveTo(i, ...to.position, ...to.size, to.rotation);
+    }
     this.field.layout();
+  }
+
+  _placement(i) {
+    return { position: this.field.worldCentre(i, new THREE.Vector3()).toArray(),
+      size: [this.field.sizes[i * 2], this.field.sizes[i * 2 + 1]],
+      rotation: this.field.worldOrientation(i, new THREE.Quaternion()) };
   }
 
   collapse() {
     if (this.piles.spreadPile >= 0) {
-      this._collapsePile(this.piles.spreadPile);
+      this._notifyInteraction();
+      if (this._trayRim) this._trayRim.visible = false;
+      this._collapsePile(this.piles.spreadPile, { animate: true });
       this._labels();
-      this.fitView();
+      const origin = this._returnPose; this._returnPose = null;
+      if (origin) {
+        this._box = this._returnBox || null;
+        // The tray labels are landmarks, not followers of their moving cards.
+        this._returnLabels?.forEach((position, i) => this.labelObjs[i]?.position.copy(position));
+        this._returnLabels = null;
+        this._moveCamera(origin, { animate: true });
+      }
+      else this.fit();
     }
     this.hybrid.setFocus(-1);
   }
 
-  /** Fit actual card corners, including depth and pile labels, into the pane. */
-  fit(indices = null) {
-    if (!this.built) return;
+  /**
+   * The world box of what is currently being shown: the spread pile, or the
+   * whole field with its pile labels. Fit frames it; pan is bounded by it.
+   */
+  _measure(indices = null) {
     if (!indices && this.piles.spreadPile >= 0) indices = this.piles.piles[this.piles.spreadPile].indices;
-    indices ||= Array.from({ length: this.field.count }, (_, i) => i);
+    indices ||= this.active || [];
     const corners = [];
     const q = new THREE.Quaternion();
     for (const i of indices) {
@@ -604,7 +777,7 @@ export class SpatialView {
         corners.push(new THREE.Vector3(x * this.field.sizes[i * 2], y * this.field.sizes[i * 2 + 1], 0).applyQuaternion(q).add(c));
       }
     }
-    if (!corners.length) return;
+    if (!corners.length) return null;
     if (this.mode === 'piles' && this.piles.spreadPile < 0) {
       this.labelObjs.forEach((label, i) => {
         if (!label.visible) return;
@@ -613,7 +786,18 @@ export class SpatialView {
         corners.push(new THREE.Vector3(p.x + w / 2, p.y + 18, p.z));
       });
     }
-    const box = new THREE.Box3().setFromPoints(corners);
+    this._box = new THREE.Box3().setFromPoints(corners);
+    this._corners = corners;
+    return this._box;
+  }
+
+  /** Fit actual card corners, including depth and pile labels, into the pane. */
+  fit(indices = null, { animate = false, corners = null } = {}) {
+    if (!this.built) return;
+    const box = corners ? new THREE.Box3().setFromPoints(corners) : this._measure(indices);
+    if (!box) return;
+    corners ||= this._corners;
+    this._box = box;
     const centre = box.getCenter(new THREE.Vector3());
     const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
     const rect = this.host.getBoundingClientRect();
@@ -622,12 +806,7 @@ export class SpatialView {
     let z = 150;
     for (const p of corners) z = Math.max(z, p.z + Math.abs(p.x - centre.x) / (tan * this.camera.aspect * fx),
       p.z + Math.abs(p.y - centre.y) / (tan * fy));
-    this.lookTarget.set(centre.x, centre.y, 0);
-    this.basePos.set(centre.x, centre.y, z);
-    this.camera.position.copy(this.basePos);
-    this.camera.lookAt(this.lookTarget);
-    this.camera.updateMatrixWorld();
-    this.fitted = true;
+    this._moveCamera({ position: [centre.x, centre.y, z], target: [centre.x, centre.y, 0], fitted: true }, { animate });
   }
 
   fitView() {
@@ -638,34 +817,138 @@ export class SpatialView {
     this.fit();
   }
 
+  /**
+   * Pan only where there is clipped content to reveal. Per axis, the visible
+   * half-extent at the camera's distance from the content plane says whether
+   * the box overflows the pane: if it does, the camera may travel between the
+   * positions that bring either edge to the pane's edge; if it fits, a fully
+   * visible axis is frozen and a partly clipped one may only come back into
+   * view. Sliding a wholly visible field around is motion without information.
+   */
   panTo(x, y) {
+    this._interruptCamera();
+    const box = this._box || this._measure();
+    if (box) {
+      const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+      const halfH = Math.max(1, this.basePos.z - box.max.z) * tan, halfW = halfH * this.camera.aspect;
+      x = clampPan(this.basePos.x, x, box.min.x, box.max.x, halfW);
+      y = clampPan(this.basePos.y, y, box.min.y, box.max.y, halfH);
+    }
+    if (x === this.basePos.x && y === this.basePos.y) return;
     this.basePos.x = this.lookTarget.x = x;
     this.basePos.y = this.lookTarget.y = y;
     this.fitted = false;
   }
 
   panBy(dx, dy) {
-    const unit = 2 * this.basePos.z * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) / this.host.clientHeight;
+    const plane = this.piles.spreadPile >= 0 ? 140 : 0;
+    const unit = 2 * Math.max(1, this.basePos.z - plane) * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) / this.host.clientHeight;
     this.panTo(this.basePos.x - dx * unit, this.basePos.y + dy * unit);
   }
 
-  zoomBy(factor) {
-    this.basePos.z = Math.min(12000, Math.max(250, this.basePos.z / factor));
+  zoomBy(factor, clientX, clientY) {
+    if (!Number.isFinite(factor) || factor <= 0) return;
+    this._interruptCamera();
+    const rect = this.host.getBoundingClientRect();
+    const nx = Number.isFinite(clientX) ? 2 * (clientX - rect.left) / rect.width - 1 : 0;
+    const ny = Number.isFinite(clientY) ? 1 - 2 * (clientY - rect.top) / rect.height : 0;
+    const oldZ = this.basePos.z;
+    const plane = this.piles.spreadPile >= 0 ? 140 : 0;
+    const z = Math.min(12000, Math.max(250, plane + (oldZ - plane) / factor));
+    const tan = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+    // The reading plane's depth cancels from the old/new ray difference.
+    this.basePos.x += nx * (oldZ - z) * tan * this.camera.aspect;
+    this.basePos.y += ny * (oldZ - z) * tan;
+    this.lookTarget.x = this.basePos.x; this.lookTarget.y = this.basePos.y;
+    this.basePos.z = z;
     this.fitted = false;
+    this._syncCamera();
+  }
+
+  _reducedMotion() { return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false; }
+
+  _cameraPose() {
+    return { position: this.basePos.toArray(), target: this.lookTarget.toArray(), fitted: this.fitted };
+  }
+
+  _syncCamera() {
+    this.camera.position.copy(this.basePos); this.camera.lookAt(this.lookTarget);
+    this.camera.updateMatrixWorld(); this.invalidate();
+  }
+
+  _interruptCamera() { this._cameraMotion = null; this._notifyInteraction(); }
+
+  _moveCamera(pose, { animate = false, duration = 300 } = {}) {
+    this._interruptCamera();
+    if (!animate || this._reducedMotion()) {
+      this.basePos.fromArray(pose.position); this.lookTarget.fromArray(pose.target);
+      this.fitted = pose.fitted; this._syncCamera(); return;
+    }
+    this._cameraMotion = { from: this._cameraPose(), to: pose, start: performance.now(), duration };
+    this.fitted = false;
+    this.invalidate();
+  }
+
+  _tickCamera(now) {
+    const motion = this._cameraMotion;
+    if (!motion) return;
+    const t = Math.min(1, Math.max(0, (now - motion.start) / motion.duration));
+    const k = this._reducedMotion() ? 1 : 1 - (1 - t) ** 3;
+    this.basePos.set(...motion.from.position.map((v, i) => v + (motion.to.position[i] - v) * k));
+    this.lookTarget.set(...motion.from.target.map((v, i) => v + (motion.to.target[i] - v) * k));
+    if (k === 1) {
+      this.basePos.fromArray(motion.to.position); this.lookTarget.fromArray(motion.to.target);
+      this.fitted = motion.to.fitted; this._cameraMotion = null;
+    }
+    this.invalidate();
+  }
+
+  /** Viewport rectangle of this identity's currently rendered quad. */
+  originRectangle(clipOrKey) {
+    if (!this.built || !clipOrKey) return null;
+    const key = typeof clipOrKey === 'string' ? clipOrKey : keyOfClip(clipOrKey);
+    const i = this.clips.findIndex(clip => keyOfClip(clip) === key);
+    if (i < 0 || !this.field.isActive(i)) return null;
+    const rect = this.host.getBoundingClientRect(), { position, size, rotation } = this._placement(i);
+    const centre = new THREE.Vector3(...position);
+    const points = [-.5, .5].flatMap(x => [-.5, .5].map(y =>
+      new THREE.Vector3(x * size[0], y * size[1], 0).applyQuaternion(rotation).add(centre).project(this.camera)));
+    const left = rect.left + (Math.min(...points.map(p => p.x)) + 1) * rect.width / 2;
+    const top = rect.top + (1 - Math.max(...points.map(p => p.y))) * rect.height / 2;
+    const width = (Math.max(...points.map(p => p.x)) - Math.min(...points.map(p => p.x))) * rect.width / 2;
+    const height = (Math.max(...points.map(p => p.y)) - Math.min(...points.map(p => p.y))) * rect.height / 2;
+    return { x: left, y: top, left, top, width, height, right: left + width, bottom: top + height };
+  }
+
+  _domEligible(i) {
+    if (this.mode === 'piles' && !(this.piles.spreadPile >= 0 ? this._spreadMembers?.has(i) : this._pileTops?.has(i))) return false;
+    const c = this.field.centres, s = this.field.sizes;
+    const depth = this.camera.position.z - c[i * 3 + 2];
+    if (depth <= 0) return false;
+    const halfH = depth * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+    const halfW = halfH * this.camera.aspect;
+    if (Math.abs(c[i * 3] - this.camera.position.x) > halfW + s[i * 2] / 2 ||
+        Math.abs(c[i * 3 + 1] - this.camera.position.y) > halfH + s[i * 2 + 1] / 2) return false;
+    const px = Math.min(s[i * 2], s[i * 2 + 1]) * this.host.clientHeight / (2 * halfH);
+    return px >= (this.hybrid?.live.has(i) ? 56 : 72);
   }
 
   /* ----------------------------------------------------------- piles ---- */
 
   /** Facet values become piles. Multi-valued facets put a clip in several. */
   showPiles(facetKey) {
+    this._returnPose = null;
+    this._notifyInteraction();
+    if (this._trayRim) this._trayRim.visible = false;
     // Share date buckets and multi-valued membership with the flat layout.
-    const indexOf = new Map(this.clips.map((clip, i) => [clip, i]));
+    const indexOf = this._indexOf || new Map(this.clips.map((clip, i) => [clip, i]));
+    const active = this.active || [];
     // One quad per clip: a clip in several groups (multi-valued facets) can
     // stand in only one pile. It is placed in the smallest group it belongs
     // to, so small piles keep their members and large piles lose few; every
     // pile keeps its true count and full membership, and a spread pile
     // temporarily borrows its shared members.
-    const raw = groupBy(this.clips, facetKey).map(({ label, clips }) => ({ label, all: clips.map(clip => indexOf.get(clip)) }));
+    const raw = groupBy(active.map(i => this.clips[i]), facetKey).map(({ label, clips }) => ({ label, all: clips.map(clip => indexOf.get(clip)) }));
     const placed = new Set();
     for (const g of [...raw].sort((a, b) => a.all.length - b.all.length)) {
       g.indices = g.all.filter(i => !placed.has(i));
@@ -685,7 +968,7 @@ export class SpatialView {
   }
 
   showMountain() {
-    this.setClips(this.clips, this.groupKey);
+    this._show();
   }
 
   _stepPile(dir) {
@@ -711,6 +994,7 @@ export class SpatialView {
   /** One CSS3D label per pile. Nodes only — labels are facet values, which are
    *  scraped strings like any other. */
   _labels() {
+    this._dirty = true;
     // Exposed covers: every member on a pile's contact-sheet face may be promoted to DOM.
     this._pileTops = new Set(this.piles.piles.flatMap((_, i) => this.piles.faceOf(i)));
     for (const o of this.labelObjs) o.visible = false;
@@ -740,7 +1024,9 @@ export class SpatialView {
       }
       obj.position.set(a.x, (Number.isFinite(top) ? top : a.y) + 10, front + 5);
       obj.scale.setScalar(Math.max(0.9, a.width / 440));
-      obj.visible = this.piles.spreadPile < 0;
+      const opened = this.piles.spreadPile === i;
+      if (opened && this._spreadExtent) obj.position.set(this._spreadExtent.x, this._spreadExtent.top + 20, 145);
+      obj.visible = this.piles.spreadPile < 0 || opened;
     });
   }
 
@@ -762,6 +1048,8 @@ export class SpatialView {
   }
 
   restoreView(view) {
+    this._returnPose = null;
+    this._interruptCamera();
     if (view.mode === 'piles') {
       this.restore(view.arrangement);
       view.arrangement.piles.forEach((saved, i) => {
@@ -774,7 +1062,7 @@ export class SpatialView {
       }
       this._labels();
     } else this.showMountain();
-    const selected = this.clips.findIndex(c => keyOfClip(c) === view.selection);
+    const selected = (this.active || []).find(i => keyOfClip(this.clips[i]) === view.selection) ?? -1;
     if (selected >= 0) this.nav.select(selected);
     if (view.fitted) this.fit();
     else {
@@ -797,8 +1085,11 @@ export class SpatialView {
 
   /** @returns {{restored:number, orphaned:string[]}} */
   restore(state) {
+    if (this._trayRim) this._trayRim.visible = false;
+    // Only in-scope items resolve; a hidden member is unresolved for this view
+    // and survives in the saved state like any other unresolved key.
     const byKey = new Map();
-    this.clips.forEach((clip, i) => byKey.set(keyOfClip(clip), i));
+    for (const i of this.active || []) byKey.set(keyOfClip(this.clips[i]), i);
     const result = this.piles.restore(state, (k) => (byKey.has(k) ? byKey.get(k) : -1));
     // Saved piles may share members too: place each clip in its smallest pile,
     // keep the full membership for spreading and the true count for the label.
@@ -822,17 +1113,46 @@ export class SpatialView {
   _bindPointer() {
     const el = this.host;
     let down = null;
+    const touches = new Map();
+    let pinch = null;
+    const touchPose = () => {
+      const [a, b] = [...touches.values()];
+      return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, distance: Math.hypot(a.x - b.x, a.y - b.y) };
+    };
     el.addEventListener('wheel', (e) => {
       e.preventDefault(); e.stopPropagation();
-      if (e.ctrlKey || e.metaKey) this.zoomBy(Math.exp(-e.deltaY * 0.008));
+      if (e.ctrlKey || e.metaKey) this.zoomBy(Math.exp(-e.deltaY * 0.008), e.clientX, e.clientY);
       else this.panBy(-e.deltaX, -e.deltaY);
     }, { passive: false });
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || e.target.closest('a, button')) return;
       e.stopPropagation();
+      this._interruptCamera();
+      if (e.pointerType === 'touch') {
+        touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touches.size >= 2) {
+          if (touches.size === 2) pinch = touchPose();
+          down = null; this._dragged = true;
+          el.setPointerCapture(e.pointerId);
+          return;
+        }
+      }
       down = { x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, moved: false };
     });
     el.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'touch' && touches.has(e.pointerId)) {
+        touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touches.size >= 2) {
+          e.stopPropagation();
+          const next = touchPose();
+          if (pinch?.distance > 0 && next.distance > 0) {
+            this.zoomBy(next.distance / pinch.distance, pinch.x, pinch.y);
+            this.panBy(next.x - pinch.x, next.y - pinch.y);
+          }
+          pinch = next;
+          return;
+        }
+      }
       if (!down) return;
       e.stopPropagation();
       if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4) down.moved = true;
@@ -864,8 +1184,15 @@ export class SpatialView {
       });
     });
     el.addEventListener('pointerleave', () => this._endHover());
-    el.addEventListener('pointercancel', () => { down = null; this._endHover(); });
+    el.addEventListener('pointercancel', (e) => {
+      touches.delete(e.pointerId); pinch = null;
+      down = null; this._endHover();
+    });
     el.addEventListener('pointerup', (e) => {
+      if (touches.delete(e.pointerId)) {
+        if (touches.size < 2) pinch = null;
+        if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      }
       if (!down) return;
       e.stopPropagation();
       const moved = down.moved; down = null;

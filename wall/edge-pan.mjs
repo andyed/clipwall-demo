@@ -4,15 +4,31 @@ const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const DEAD_ZONE = 32;
 const ZOOM_DISTANCE = 320;
 
-export function boundPan(view, area, bounds) {
+/**
+ * Constrain a camera so a pan only ever reveals clipped content.
+ *
+ * Per axis, `a` puts the collection's near edge at the margin and `b` its far
+ * edge at the opposite margin. When the collection overflows the stage
+ * (b < a) any position between them shows something that was clipped, so the
+ * range is open. When it fits (a ≤ b) there is nothing to reveal, and sliding
+ * a fully visible collection around inside the stage is motion without
+ * information — so, given the position the gesture started `from`, the axis
+ * is frozen: a fully visible axis does not move, and a partly clipped one may
+ * move only toward full visibility, never past it. Without `from` (an anchored
+ * zoom, which has no prior position on the new scale) the old clamp applies.
+ */
+export function boundPan(view, area, bounds, from = null) {
   const margin = Math.min(24, area.w * 0.04, area.h * 0.04);
-  const axis = (position, lo, hi, length) => {
+  const axis = (position, current, lo, hi, length) => {
     const a = margin - lo * view.scale;
     const b = length - margin - hi * view.scale;
-    return clamp(position, Math.min(a, b), Math.max(a, b));
+    if (from === null || b < a) return clamp(position, Math.min(a, b), Math.max(a, b));
+    if (current < a) return clamp(position, current, a);   // near edge clipped: may come back, not go further
+    if (current > b) return clamp(position, b, current);   // far edge clipped: likewise
+    return current;                                         // fully visible: nothing to reveal
   };
-  return { x: axis(view.x, bounds.x, bounds.x + bounds.w, area.w),
-    y: axis(view.y, bounds.y, bounds.y + bounds.h, area.h), scale: view.scale };
+  return { x: axis(view.x, from?.x, bounds.x, bounds.x + bounds.w, area.w),
+    y: axis(view.y, from?.y, bounds.y, bounds.y + bounds.h, area.h), scale: view.scale };
 }
 
 export class EdgePan {
@@ -23,12 +39,12 @@ export class EdgePan {
     if (!bounds) return { ...view, x: view.x + dx, y: view.y + dy, phase: '' };
     if (!zoom) {
       this.reset();
-      const next = boundPan({ ...view, x: view.x + dx, y: view.y + dy }, area, bounds);
+      const next = boundPan({ ...view, x: view.x + dx, y: view.y + dy }, area, bounds, view);
       return { ...next, phase: next.x !== view.x + dx || next.y !== view.y + dy ? 'limit' : '' };
     }
     if (!this.latch) {
       const proposed = { ...view, x: view.x + dx, y: view.y + dy };
-      const base = boundPan(proposed, area, bounds);
+      const base = boundPan(proposed, area, bounds, view);
       const ox = proposed.x - base.x, oy = proposed.y - base.y;
       const length = Math.hypot(ox, oy);
       if (length < 0.01) return { ...base, phase: '' };
@@ -58,11 +74,11 @@ export class EdgePan {
     // latched scale so changing scale cannot alternate pan/zoom every frame.
     l.base = boundPan({ ...l.base,
       x: l.base.x + (corner ? 0 : dx - normalDelta * l.normal.x),
-      y: l.base.y + (corner ? 0 : dy - normalDelta * l.normal.y) }, area, bounds);
+      y: l.base.y + (corner ? 0 : dy - normalDelta * l.normal.y) }, area, bounds, l.base);
     if (pressure < 0) {
       const next = boundPan({ ...l.base,
         x: l.base.x + l.normal.x * pressure,
-        y: l.base.y + l.normal.y * pressure }, area, bounds);
+        y: l.base.y + l.normal.y * pressure }, area, bounds, l.base);
       this.reset();
       return { ...next, phase: '' };
     }

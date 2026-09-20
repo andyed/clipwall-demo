@@ -6,6 +6,8 @@
 <title>clipwall</title>
 <link rel="stylesheet" href="wall/wall.css">
 <link rel="stylesheet" href="wall/attribute-brush.css">
+<link rel="stylesheet" href="wall/reader-lift.css">
+<link rel="stylesheet" href="wall/overview-surface.css">
   <link rel="stylesheet" href="wall/spatial/spatial.css">
 </head>
 <body>
@@ -58,10 +60,13 @@
   <div class="row-title" id="row-title" hidden>
     <button class="rt-focus" type="button"><strong></strong><span class="n"></span><span class="pos"></span></button>
     <button class="rt-next" type="button" aria-label="Next group">›</button>
+    <button id="group-filter" type="button" aria-label="Filter to this group">⊙</button>
   </div>
   <div class="review-tip" id="review-tip"></div>
   <span class="edge-feedback sr-only" id="edge-feedback" role="status"></span>
   <button class="btn edge-undo" id="edge-undo" type="button" hidden aria-label="Undo edge zoom">↶</button>
+  <button class="btn tray-return" id="tray-return" type="button" hidden aria-label="Return to collection">↶</button>
+  <button class="btn tray-filter" id="tray-filter" type="button" hidden aria-label="Filter to approached group">⊙</button>
 </main>
 
 <aside class="detail" id="detail" aria-label="Clip detail"></aside>

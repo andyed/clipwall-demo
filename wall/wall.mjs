@@ -15,9 +15,13 @@ import { sortClips } from './attributes.mjs';
 import { createAttributeBrush } from './attribute-brush.mjs';
 import { createPermalinks, canonical } from './permalink.mjs';
 import { clipKey, filterScope, chooseCluster, contextClusters, valuesOf } from './context-clusters.mjs';
-import { layout, frameAround, HEADER_H } from './layout.mjs';
+import { layout, groupBy, frameAround, HEADER_H } from './layout.mjs';
 import { Viewport } from './viewport.mjs';
 import { createDetailPane } from './detail-pane.mjs';
+import { createReaderLift, createReaderMedia } from './reader-lift.mjs';
+import { OverviewSurface } from './overview-surface.mjs';
+import { animateLayout, captureLayoutMotion } from './layout-motion.mjs';
+import { createImageWork } from './image-work.mjs';
 import { ViewStateStore, mergePileState } from './view-state.mjs';
 
 /** Facets that exist for layout, not for browsing. */
@@ -42,6 +46,7 @@ const state = {
   renderAspect: 1,
   arrangementOverride: null,
   permalinkBar: false,
+  scopeBarSeen: false,
   unresolvedFocus: null,
   detailMedia: null,
   facetLabels: {},
@@ -52,6 +57,8 @@ const state = {
   spatial: null,       // lazily constructed SpatialView
   spatialOn: false,
   spatialLoading: false,
+  flatDirty: false, spatialDirty: false,
+  detailReturn: null, trayReturn: null,
   clipKey: null,
   viewState: new ViewStateStore(),
   viewStateError: '',
@@ -77,6 +84,21 @@ const el = {
 
 const detailPane = createDetailPane(el.detail, el.stage);
 const viewport = new Viewport(el.stage, el.canvas, onViewportChange);
+const readerLift = createReaderLift();
+const readerMedia = createReaderMedia();
+const imageWork = createImageWork();
+const overview = new OverviewSurface(el.stage);
+let overviewFrame = 0, layoutMotionUntil = 0;
+function syncOverview() {
+  cancelAnimationFrame(overviewFrame); overviewFrame = 0;
+  const enabled = !state.spatialOn && !el.canvas.hasAttribute('data-brush-key')
+    && performance.now() >= layoutMotionUntil;
+  overview.setEnabled(enabled);
+  if (!enabled) return;
+  const rect = el.stage.getBoundingClientRect(), moving = performance.now() < viewport.settlesAt;
+  overview.setViewport(viewport.visiblePose(), { width: rect.width, height: rect.height, moving });
+  if (moving) overviewFrame = requestAnimationFrame(syncOverview);
+}
 // The smallest useful scale: Fit of the foreground, or of the foreground plus
 // the context plane when there is one. Below it there is only empty canvas.
 viewport.scaleFloor = () => {
@@ -96,6 +118,7 @@ const brush = createAttributeBrush({
   onSort: (key, direction) => setSort(key, direction),
   onPinnedChange: key => { document.getElementById('attribute-lens').value = key || 'none'; },
 });
+new MutationObserver(syncOverview).observe(el.canvas, { attributes: true, attributeFilter: ['data-brush-key', 'data-brush-mode'] });
 const header = document.querySelector('.bar');
 new ResizeObserver(() => document.documentElement.style.setProperty('--bar-h', `${header.getBoundingClientRect().height}px`)).observe(header);
 const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -127,7 +150,7 @@ function captureView() {
   return { v: 1, layoutVersion: 1, corpus: state.corpus,
     scope: { query: state.query, facets: [...state.active].filter(([, v]) => v.size).map(([k, v]) => [k, [...v].sort()]).sort(([a], [b]) => a.localeCompare(b)), branches: state.branches },
     presentation: { mode: state.spatialOn ? '3d' : 'flat', group: state.groupKey, pan: viewport.panMode, sort: { ...state.sort } },
-    flat: { view: viewport.snapshot(), stage: { w: r.width, h: r.height }, aspect: state.renderAspect },
+    flat: { view: { ...viewport.snapshot(), ...(state.flatDirty ? { fitted: true } : {}) }, stage: { w: r.width, h: r.height }, aspect: state.renderAspect },
     spatial,
     ui: { lens: brush.getPinned(), mediaSource: state.detailMedia, rail: !el.rail.classList.contains('hidden'), context: state.contextVisible, scopeBar: !document.getElementById('scope-bar').hidden,
       focus: state.clips.find(c => c.id === state.selected) ? clipKey(state.clips.find(c => c.id === state.selected)) : state.unresolvedFocus,
@@ -144,6 +167,7 @@ async function restoreView(spec) {
   if (missing.size) warnings.push(`${missing.size} missing item identities retained in the link`);
   try {
     state.permalinkBar = !!spec.ui.scopeBar;
+    state.scopeBarSeen = !!spec.ui.scopeBar;
     state.query = spec.scope.query; state.active = new Map(spec.scope.facets.map(([k, v]) => [k, new Set(v)]));
     state.branches = structuredClone(spec.scope.branches);
     state.sort = spec.presentation.sort || { key: 'none', direction: 'asc' };
@@ -169,6 +193,8 @@ async function restoreView(spec) {
     } else { state.unresolvedFocus = spec.ui.focus; warnings.push('Focused item is unavailable'); } }
     state.layoutAspect = spec.flat.view.fitted ? null : spec.flat.aspect;
     state.filtered = filterScope(state.clips, state);
+    state.flatDirty = state.spatialDirty = true;
+    clearTrayReturn();
     state.clusters = contextClusters(state.clips, state.filtered, state.facetLabels, state.active);
     renderScope(); renderContext();
     await frames(); render();
@@ -270,17 +296,23 @@ function applyFilters({ restore = null } = {}) {
   state.filtered = filterScope(state.clips, state);
   state.clusters = contextClusters(state.clips, state.filtered, state.facetLabels, state.active);
   renderScope(); renderContext();
-  if (state.spatial?.built) refreshSpatial();
-  render();
+  invalidatePreview(); clearTrayReturn();
+  if (state.selected && !state.filtered.some(c => c.id === state.selected)) closeDetail();
+  state.flatDirty = state.spatialDirty = true;
+  // Scope is authoritative now; a hidden presentation materializes on entry.
+  if (state.spatialOn) { refreshSpatial(); updateReviewOrder(); renderCount(); }
+  else render();
   filterFrame = requestAnimationFrame(() => {
-    if (restore) viewport.restore(restore);
-    else viewport.fit();
+    if (!state.spatialOn) { if (restore) viewport.restore(restore); else viewport.fit(); }
   });
 }
 function renderScope() {
   const host = document.getElementById('scope-bar');
   const scoped = !!state.branches || !!state.query.trim() || [...state.active.values()].some(v => v.size);
-  host.hidden = !state.permalinkBar && !scoped && !(links?.ready ? links.canBack : state.scopeHistory.length);
+  // Camera/detail history must not insert a new layout band beneath the desk.
+  // Keep recovery available after actual scope work, including clearing it.
+  state.scopeBarSeen ||= scoped;
+  host.hidden = !state.permalinkBar && !state.scopeBarSeen;
   document.body.classList.toggle('has-scope', !host.hidden);
   document.getElementById('scope-back').disabled = links?.ready ? !links.canBack : !state.scopeHistory.length;
   const summary = document.getElementById('scope-summary');
@@ -403,7 +435,7 @@ function backgroundKey() {
   return [state.groupKey, state.sort.key, state.sort.direction, state.renderAspect.toFixed(3), base.length,
     state.contextBase ? state.contextBase.label : 'all'].join('|');
 }
-function renderBackground(foreground) {
+function renderBackground(foreground, stageRect = null) {
   const base = contextClips();
   const inBase = new Set(base.map(clipKey));
   // Results that share nothing with the pre-search place have no context there: the plane fades away.
@@ -417,7 +449,7 @@ function renderBackground(foreground) {
   }
   state.background.framed = frameAround(state.background.full, { w: foreground.width, h: foreground.height });
   state.background.foreground = { w: foreground.width, h: foreground.height };
-  if (state.contextVisible) mountBackground(); else unmountBackground();
+  if (state.contextVisible) mountBackground(stageRect); else unmountBackground();
 }
 /**
  * Depth and tilt of the plane, in world units so they scale with the camera.
@@ -467,17 +499,17 @@ function planeLabelSizes(s) {
   bgPlane.style.setProperty('--group-label-unit', `${m / s}px`);
 }
 viewport.mirror = mirrorBackground;
-function mountBackground() {
+function mountBackground(stageRect = null) {
   const framed = state.background.framed;
   if (!framed) return;
   const inScope = new Set(state.filtered.map(clipKey));
   const seen = new Set();
   state.bgPositions.clear();
-  const r = el.stage.getBoundingClientRect();
+  const r = stageRect || el.stage.getBoundingClientRect();
   state.background.stage = { w: r.width, h: r.height };
   const m = state.background.m = planeScale(state.background.stage);
   for (const stale of bgPlane.querySelectorAll('.block')) stale.remove();
-  state.bgBlockEls = framed.blocks.map(b => { const node = buildBlock({ ...b, x: b.x * m, y: b.y * m, w: b.w * m, h: b.h * m }); bgPlane.append(node); return node; });
+  state.bgBlockEls = framed.blocks.map(b => { const node = buildBlock({ ...b, x: b.x * m, y: b.y * m, w: b.w * m, h: b.h * m }, { background: true }); bgPlane.append(node); return node; });
   for (const t of framed.tiles) {
     const key = JSON.stringify(['bg', t.group ?? '', t.clip.id]);
     seen.add(key); state.bgPositions.set(key, t); // world units, for culling
@@ -497,7 +529,7 @@ function mountBackground() {
   state.background.mounted = true;
   // Bounded/edge pan may now reach the whole plane; Fit content stays the foreground.
   viewport.setItems([...state.positions.values(), ...framed.tiles]);
-  updateVisibility();
+  updateVisibility({ rect: r });
 }
 function unmountBackground() {
   if (!state.background.mounted) return;
@@ -568,7 +600,8 @@ async function toggleSpatial(on) {
         // Same preview the flat wall uses. The view guards touch and drag and
         // coalesces to one pick per frame; hoverEnabled keeps it from picking
         // at all until there is a selection for a preview to override.
-        onHover: (clip) => hoverPreview(clip),
+        onHover: (clip, event) => hoverPreview(clip, event),
+        onInteraction: invalidatePreview,
         onHoverEnd: hoverEnd,
         hoverEnabled: () => !!state.selected,
       });
@@ -601,16 +634,27 @@ async function toggleSpatial(on) {
   el.canvas.style.visibility = on ? 'hidden' : '';
   el.view3d.setAttribute('aria-pressed', String(on));
   el.view3d.classList.toggle('on', on);
-  if (!on) updateBackgroundVisibility();
+  if (!on) {
+    if (state.flatDirty) { render(); viewport.fit(); }
+    updateBackgroundVisibility();
+  }
+  syncOverview();
   if (on) {
-    refreshSpatial();
+    if (state.spatialDirty || !state.spatial.built) refreshSpatial();
     document.getElementById('sp-css3d')?.focus();
   }
+  // Flat navigation belongs to its presentation. Keep its return pose across
+  // a renderer switch, but never leave invisible-wall controls over the field.
+  updateRowTitle(el.stage.getBoundingClientRect());
+  trayReturnButton.hidden = trayFilterButton.hidden = on || !state.trayReturn;
 }
 
 function refreshSpatial() {
+  state.spatialDirty = false;
   // The scene and current clip map must exist BEFORE restoring URL-keyed piles.
-  state.spatial.setClips(state.filtered, state.groupKey);
+  // The corpus and its revision: the field is built once per corpus and a
+  // filter is membership, so narrowing and widening never reload a tile.
+  state.spatial.setClips(state.filtered, state.groupKey, { corpus: state.clips, revision: state.corpus?.revision ?? 'unversioned' });
   const doc = state.arrangementOverride || state.viewState.doc;
   if (doc?.piles?.length && doc.mode !== 'mountain') state.spatial.restore(doc);
   else if (state.groupKey !== 'none') state.spatial.showPiles(state.groupKey);
@@ -658,9 +702,24 @@ async function saveViewState() {
 
 /* -------------------------------------------------------------- render --- */
 
+function updateReviewOrder() {
+  // Review order remains available without laying out a hidden DOM wall.
+  const seen = new Set();
+  state.order = groupBy(sortClips(state.filtered, state.sort), state.groupKey).flatMap(g => g.clips).filter(clip => {
+    if (seen.has(clip.id)) return false; seen.add(clip.id); return true;
+  });
+}
 function render() {
+  state.flatDirty = false;
+  state.layoutEpoch = (state.layoutEpoch || 0) + 1;
+  invalidatePreview();
+  imageWork.clear();
+  const previous = captureLayoutMotion(state.positions);
+  // One measurement, read before any write and threaded through everything
+  // below. Each further getBoundingClientRect() after a style write forced a
+  // synchronous layout of the whole wall; a filter change paid that four times.
   const bounds = el.stage.getBoundingClientRect();
-  const pad = viewport.fitPadding();
+  const pad = viewport.fitPadding(bounds);
   state.renderAspect = state.layoutAspect || Math.max(1, bounds.width - pad * 2) / Math.max(1, bounds.height - pad * 2);
   const result = layout(sortClips(state.filtered, state.sort), state.groupKey, {
     viewportAspect: state.renderAspect
@@ -676,10 +735,16 @@ function render() {
   { const seen = new Set(); state.order = []; for (const t of result.tiles) if (!seen.has(t.clip.id)) { seen.add(t.clip.id); state.order.push(t.clip); } }
   renderBlocks(result.blocks);
   renderTiles(result.tiles);
+  const motionCount = animateLayout(previous, state.positions, state.tileEls, viewport.visiblePose(), bounds);
+  layoutMotionUntil = motionCount ? performance.now() + 240 : 0;
+  overview.setEnabled(false);
+  overview.setTiles([...state.positions].map(([key, t]) => ({ ...t, key, node: state.tileEls.get(key) })));
+  if (motionCount) setTimeout(syncOverview, 250); else syncOverview();
   // A new layout means new slots: showcase cards restart from the fresh geometry.
   if (showcase.on) { for (const card of showcase.cards.values()) card.remove(); showcase.cards.clear(); }
-  renderBackground(result);
+  renderBackground(result, bounds);
   brush.refresh();
+  applyScaleStyles(viewport.scale, { force: true });
 
   renderCount();
 
@@ -691,7 +756,7 @@ function render() {
       state.clips.length ? 'Clear the filters, or widen the search.' : null
     );
   }
-  updateVisibility();
+  updateVisibility({ rect: bounds });
 }
 
 function renderCount() {
@@ -723,13 +788,13 @@ function updateTightBlocks(s) {
   const mark = (blocks, nodes) => { if (!blocks || !nodes) return;
     for (let i = 0; i < nodes.length; i++) {
       const b = blocks[i];
-      nodes[i].classList.toggle('tight', b.w * s < TIGHT_BLOCK_PX || text > (b.tileH || 240) * s * TIGHT_TEXT_RATIO);
+      nodes[i].classList.toggle('tight', b.w * s < TIGHT_BLOCK_PX || text > (b.tileH || 240) * s * TIGHT_TEXT_RATIO || HEADER_H * s < text * 1.25 + 8);
     } };
   mark(state.blocks, state.blockEls);
   if (state.background.mounted) mark(state.background.framed?.blocks, state.bgBlockEls);
 }
 
-function buildBlock(b) {
+function buildBlock(b, { background = false } = {}) {
   const div = document.createElement('div');
   div.className = 'block';
   div.style.width = `${b.w}px`;
@@ -739,13 +804,12 @@ function buildBlock(b) {
   div.dataset.tileH = String(Math.round(b.tileH || 0));
   const h2 = document.createElement('h2');
   h2.textContent = b.label;                       // untrusted: textContent only
-  // A heading is a control: it narrows the working set to that group. On the
-  // context plane this is the scope pivot; in the foreground it is a group Dive.
+  // Foreground headings approach a tray; context headings explicitly pivot scope.
   if (b.label && b.label !== '—') {
     h2.tabIndex = 0; h2.setAttribute('role', 'button');
-    h2.setAttribute('aria-label', `${b.label}: show only this ${state.facetLabels[state.groupKey] || state.groupKey}, ${b.count} items`);
-    h2.addEventListener('click', e => { if ((viewport.lastDragDistance || 0) > 4) return; selectGroup(b.label, e.shiftKey); });
-    h2.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectGroup(b.label, e.shiftKey); } });
+    h2.setAttribute('aria-label', `${b.label}: ${background ? 'filter to' : 'approach'} this group, ${b.count} items`);
+    h2.addEventListener('click', e => { if ((viewport.lastDragDistance || 0) > 4) return; if (background || e.shiftKey) selectGroup(b.label, e.shiftKey); else approachGroup(b); });
+    h2.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (background || e.shiftKey) selectGroup(b.label, e.shiftKey); else approachGroup(b); } });
   }
   const n = document.createElement('span');
   n.textContent = String(b.count);
@@ -837,13 +901,13 @@ function buildTile(clip, { background = false } = {}) {
   cap.append(t, m);
   node.append(cap);
 
-  const open = () => openDetail(clip);
+  const open = () => openDetail(clip, { sourceNode: node });
   node.addEventListener('click', () => {
     // Suppress the click that ends a pan; 4px of slop covers a shaky trackpad.
     if ((viewport.lastDragDistance || 0) > 4) return;
     open();
   });
-  node.addEventListener('pointerenter', (e) => hoverPreview(clip, e));
+  node.addEventListener('pointermove', (e) => hoverPreview(clip, e));
   node.addEventListener('pointerleave', hoverEnd);
   node.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
@@ -853,25 +917,36 @@ function buildTile(clip, { background = false } = {}) {
 
 /* ------------------------------------------------- visibility & zoom  --- */
 
-let labelScaleApplied = 0;
-function onViewportChange(v) {
-  const s = v.scale;
-  // Read layout before any style write: a rect read after a write forces a
-  // synchronous layout of every tile, on every frame of a zoom gesture.
-  const stageRect = el.stage.getBoundingClientRect();
+let labelScaleApplied = 0, scaleStyleTimer = 0;
+/**
+ * Everything whose CSS depends on the camera scale: label sizes, the caption
+ * zoom tiers, tight-block headings and the context plane's internal scale.
+ *
+ * Each of these invalidates style on every tile — the label variables sit on
+ * the stage and feed every caption and heading — so one application costs a
+ * full restyle and layout of the wall (~15 ms at 1,800 tiles). Applied on
+ * every wheel tick of a zoom that was 20 such passes per gesture, 340 ms of
+ * style and 370 ms of layout, with 12 long tasks. Now it runs once, when the
+ * eased zoom lands (see updateVisibility for the same rule on image loads);
+ * mid-flight the compositor scales the existing raster, which is what a
+ * gesture should look like anyway. Reduced motion has no transition, so the
+ * pass is immediate there and the tests' expectations hold unchanged.
+ */
+function applyScaleStyles(s = viewport.scale, { force = false } = {}) {
+  clearTimeout(scaleStyleTimer); scaleStyleTimer = 0;
   // Screen-space label sizes are expressed in world units, so they would change
   // on every frame. Re-apply them only once the zoom has drifted ~8% from the
-  // last applied value; between updates the compositor scales the text raster,
-  // which is smoother than re-laying out every heading per frame.
-  if (!labelScaleApplied || Math.abs(Math.log(s / labelScaleApplied)) > 0.08) {
+  // last applied value.
+  if (force || !labelScaleApplied || Math.abs(Math.log(s / labelScaleApplied)) > 0.08) {
     labelScaleApplied = s;
-    // Set on the stage so the background plane, a sibling layer, inherits them.
-    el.stage.style.setProperty('--label-scale', String(Math.max(1, 1 / s)));
-    // Group names must survive overview zoom, while still responding to zoom.
-    const headingSize = Math.min(28, 14 + 5 * Math.log2(1 + s));
-    el.stage.style.setProperty('--group-heading-size', `${headingSize / s}px`);
-    el.stage.style.setProperty('--group-count-size', `${Math.max(12, headingSize * 0.74) / s}px`);
-    el.stage.style.setProperty('--group-label-unit', `${1 / s}px`);
+    // A stage-level inherited variable restyled every descendant. Headings
+    // belong to the small group set; captions upgrade only in visible tiles.
+    const headingSize = headingScreenPx(s);
+    for (const node of state.blockEls || []) {
+      node.style.setProperty('--group-heading-size', `${headingSize / s}px`);
+      node.style.setProperty('--group-count-size', `${Math.max(12, headingSize * 0.74) / s}px`);
+      node.style.setProperty('--group-label-unit', `${1 / s}px`);
+    }
     if (state.background.mounted) {
       // Re-layout the plane at a new internal scale once the camera has drifted
       // a factor of two from it (only while zoomed in past its base scale).
@@ -881,9 +956,20 @@ function onViewportChange(v) {
     }
     updateTightBlocks(s);
   }
+  el.canvas.classList.toggle('z-far', s < (el.canvas.classList.contains('z-far') ? 0.36 : 0.30));
+  el.canvas.classList.toggle('z-near', s > (el.canvas.classList.contains('z-near') ? 1.10 : 1.20));
+}
+function onViewportChange(v, stageRect = el.stage.getBoundingClientRect()) {
+  invalidatePreview();
+  syncOverview();
+  const s = v.scale;
+  const now = performance.now();
+  if (now < viewport.settlesAt) {
+    // A zoom is easing: apply the scale-dependent styles once it lands.
+    clearTimeout(scaleStyleTimer);
+    scaleStyleTimer = setTimeout(() => applyScaleStyles(viewport.scale), viewport.settlesAt - now + 20);
+  } else applyScaleStyles(s);
   if (state.background.mounted) state.background.stage = { w: stageRect.width, h: stageRect.height };
-  el.canvas.classList.toggle('z-far', s < 0.32);
-  el.canvas.classList.toggle('z-near', s > 1.15);
   updateVisibility({ rect: stageRect, defer: true });
   updateBackgroundVisibility(stageRect);
   updateRowTitle(stageRect);
@@ -1076,10 +1162,10 @@ function screenBlocks(stageRect) {
     x: cx + (b.x * s + viewport.x - cx) * f, y: cy + (b.y * s + viewport.y - cy) * f, w: b.w * s * f, h: b.h * s * f }));
   return flat.concat(plane);
 }
-function dominantBlock(stageRect) {
+function dominantBlock(stageRect, blocks = screenBlocks(stageRect)) {
   const W = stageRect.width, H = stageRect.height;
   let best = null, bestArea = 0;
-  for (const r of screenBlocks(stageRect)) {
+  for (const r of blocks) {
     const area = Math.max(0, Math.min(W, r.x + r.w) - Math.max(0, r.x)) * Math.max(0, Math.min(H, r.y + r.h) - Math.max(0, r.y));
     if (area > bestArea) { bestArea = area; best = r; }
   }
@@ -1087,12 +1173,14 @@ function dominantBlock(stageRect) {
 }
 function updateRowTitle(stageRect) {
   const grouped = state.groupKey && state.groupKey !== 'none';
-  const best = !state.spatialOn && grouped ? dominantBlock(stageRect) : null;
+  const blocks = !state.spatialOn && grouped ? screenBlocks(stageRect) : [];
+  const best = blocks.length ? dominantBlock(stageRect, blocks) : null;
   // The pinned title appears once the block's own heading is cropped off the top,
   // or (on the context plane) its label's left edge is off the stage.
   const headingOff = best && (best.y + HEADER_H * viewport.scale > 0 ? false : true);
   const leftOff = best && best.layer === 'context' && best.x < 0;
-  if (!best || !(headingOff || leftOff)) { rowTitle.hidden = true; return; }
+  const overviewLabels = HEADER_H * viewport.scale < headingScreenPx(viewport.scale) * 1.25 + 8;
+  if (!best || !(headingOff || leftOff || overviewLabels)) { rowTitle.hidden = true; return; }
   const list = best.layer === 'context' ? state.background.framed.blocks : state.blocks;
   const index = list.indexOf(best.b), n = list.length;
   const label = `${best.layer}\u0000${best.b.label || 'Ungrouped'}\u0000${best.b.count}\u0000${index + 1}/${n}`;
@@ -1101,7 +1189,7 @@ function updateRowTitle(stageRect) {
     rowTitle.querySelector('strong').textContent = best.b.label || 'Ungrouped';
     rowTitle.querySelector('.n').textContent = String(best.b.count);
     rowTitle.querySelector('.pos').textContent = `${index + 1} of ${n}`;
-    rowTitle.querySelector('.rt-focus').setAttribute('aria-label', `${best.b.label}, ${best.b.count} items, group ${index + 1} of ${n}${best.layer === 'context' ? ', on the context plane' : ''}. Show only this group`);
+    rowTitle.querySelector('.rt-focus').setAttribute('aria-label', `${best.b.label}, ${best.b.count} items, group ${index + 1} of ${n}${best.layer === 'context' ? ', on the context plane. Filter to this group' : '. Approach this group'}`);
     rowTitle.dataset.layer = best.layer;
     rowTitle.hidden = false;
     rowTitleWidth = rowTitle.offsetWidth; // measured only when the text changes
@@ -1110,7 +1198,7 @@ function updateRowTitle(stageRect) {
   rowTitle.dataset.label = best.b.label || '';
   // Sticky push-off: the next block's top edge pushes the title up and away.
   let push = 0;
-  for (const r of screenBlocks(stageRect)) if (r !== best && r.y > 0 && r.y < 46) push = Math.max(push, 46 - r.y);
+  for (const r of blocks) if (r !== best && r.y > 0 && r.y < 46) push = Math.max(push, 46 - r.y);
   // Parallax: drift with the block's left edge at a third of its speed, kept on stage.
   const x = Math.max(12, Math.min(stageRect.width - rowTitleWidth - 12, 12 + best.x * 0.35));
   rowTitle.style.transform = `translate(${x.toFixed(1)}px, ${(-push).toFixed(1)}px)`;
@@ -1127,7 +1215,38 @@ function stepGroup(delta) {
   viewport.panTo(x, 12 - b.y * s, { duration: 420 });
 }
 rowTitle.querySelector('.rt-next').addEventListener('click', e => stepGroup(e.shiftKey ? -1 : 1));
-rowTitle.querySelector('.rt-focus').addEventListener('click', e => { if (rowTitle.dataset.label) selectGroup(rowTitle.dataset.label, e.shiftKey); });
+rowTitle.querySelector('.rt-focus').addEventListener('click', e => {
+  if (!rowTitle.dataset.label) return;
+  if (rowTitle.dataset.layer === 'context' || e.shiftKey) selectGroup(rowTitle.dataset.label, e.shiftKey);
+  else { const b = state.blocks.find(b => b.label === rowTitle.dataset.label); if (b) approachGroup(b); }
+});
+document.getElementById('group-filter').addEventListener('click', e => {
+  if (rowTitle.dataset.label) selectGroup(rowTitle.dataset.label, e.shiftKey);
+});
+const trayReturnButton = document.getElementById('tray-return');
+const trayFilterButton = document.getElementById('tray-filter');
+function clearTrayReturn() { state.trayReturn = null; state.trayLabel = null; trayReturnButton.hidden = trayFilterButton.hidden = true; }
+function approachGroup(block) {
+  invalidatePreview();
+  if (!state.trayReturn) state.trayReturn = viewport.visiblePose();
+  const r = el.stage.getBoundingClientRect(), pad = viewport.fitPadding(r);
+  const scale = Math.min(6, (r.width - 2 * pad) / block.w, (r.height - 2 * pad) / block.h);
+  viewport.animateTo((r.width - block.w * scale) / 2 - block.x * scale,
+    (r.height - block.h * scale) / 2 - block.y * scale, scale, { duration: 300 });
+  trayReturnButton.hidden = false;
+  state.trayLabel = block.label;
+  trayFilterButton.hidden = false;
+  trayFilterButton.setAttribute('aria-label', `Filter to ${block.label}`);
+  trayReturnButton.setAttribute('aria-label', 'Return to collection');
+}
+function returnFromTray() {
+  if (!state.trayReturn) return false;
+  const pose = state.trayReturn; clearTrayReturn(); invalidatePreview();
+  viewport.animateTo(pose.x, pose.y, pose.scale, { duration: 300 }); viewport.fitted = pose.fitted;
+  return true;
+}
+trayReturnButton.addEventListener('click', returnFromTray);
+trayFilterButton.addEventListener('click', e => { if (state.trayLabel) selectGroup(state.trayLabel, e.shiftKey); });
 
 /**
  * Load images only once they can be seen, and hide the ones that cannot.
@@ -1144,10 +1263,11 @@ function updateVisibility({ rect = null, defer = false } = {}) {
   const r = viewport.visibleRect(400, rect || undefined);
   const now = performance.now();
   // While an eased zoom is still landing, decodes would pop in mid-flight.
-  const inFlight = now < viewport.settlesAt;
-  const load = !defer || (!inFlight && now - lastLoadFlush > 250);
+  const motionEnd = Math.max(viewport.settlesAt, layoutMotionUntil);
+  const inFlight = now < motionEnd;
+  const load = !inFlight && (!defer || now - lastLoadFlush > 250);
   if (load) { lastLoadFlush = now; clearTimeout(loadTimer); loadTimer = 0; }
-  else { clearTimeout(loadTimer); loadTimer = setTimeout(() => { loadTimer = 0; updateVisibility(); }, inFlight ? viewport.settlesAt - now + 30 : 120); }
+  else { clearTimeout(loadTimer); loadTimer = setTimeout(() => { loadTimer = 0; updateVisibility(); }, inFlight ? motionEnd - now + 30 : 120); }
   revealTiles(r, state.tileEls, state.positions, load);
   if (state.background.mounted) {
     // Perspective shrinks the plane toward the stage centre, so a world rect
@@ -1157,24 +1277,57 @@ function updateVisibility({ rect = null, defer = false } = {}) {
   }
 }
 function revealTiles(r, tileEls, positions, load) {
+  // This runs on every frame of a pan, over every tile. Each write below is
+  // guarded so a settled tile costs one rectangle test and nothing else: a
+  // redundant `visibility` write still dirties style, and querySelector on
+  // 1,800 tiles per frame was a measurable slice of every pan.
   for (const [id, node] of tileEls) {
     const p = positions.get(id);
     if (!p) continue;
     const visible = p.x < r.x + r.w && p.x + p.w > r.x && p.y < r.y + r.h && p.y + p.h > r.y;
-    node.style.visibility = visible ? '' : 'hidden';
+    if (p.shown !== visible) { p.shown = visible; node.style.visibility = visible ? '' : 'hidden'; }
     if (!visible || !load) continue;
-    const img = node.querySelector('img');
-    if (!img) continue;
-    if (img.dataset.srcset) {
-      // sizes is in screen pixels: CSS transforms do not inform srcset selection.
-      const sizes = `${Math.max(1, Math.ceil(p.w * viewport.scale))}px`;
-      if (img.sizes !== sizes) img.sizes = sizes;
-      if (!img.srcset) img.srcset = img.dataset.srcset;
+    if (viewport.scale >= 0.30) {
+      const labelScale = String(Math.max(1, 1 / viewport.scale));
+      if (node.style.getPropertyValue('--label-scale') !== labelScale) node.style.setProperty('--label-scale', labelScale);
     }
-    if (img.dataset.src) {
-      img.src = img.dataset.src;
-      delete img.dataset.src;
-    }
+    if (p.loaded) continue;
+    // The <img> is the tile's first child when it has one; cache it on the
+    // position record, which is rebuilt with every layout.
+    const img = p.img ?? (p.img = node.firstElementChild?.tagName === 'IMG' ? node.firstElementChild : null);
+    if (!img) { p.loaded = true; continue; }
+    const sizes = `${Math.max(1, Math.ceil(p.w * viewport.scale))}px`;
+    if (!img.dataset.src && (!img.dataset.srcset || (img.srcset && img.sizes === sizes))) continue;
+    // Spend decode slots on the biggest visible imagery, not DOM insertion order.
+    const current = () => node.isConnected && p.shown && positions.get(id) === p
+      && positions === (node.classList.contains('bg') ? state.bgPositions : state.positions);
+    imageWork.add(node, p.w * p.h * viewport.scale ** 2,
+      current,
+      async () => {
+        // A preceding job may have exchanged the image while this one queued.
+        const img = p.img;
+        if (!img || node.firstElementChild !== img || (img.srcset && img.sizes === sizes && !img.dataset.src)) return;
+        // Changing a displayed srcset/sizes can discard the old decoded request
+        // before the next one arrives. Keep that exact artwork in place while
+        // a bounded worker decodes its replacement, then exchange only pixels.
+        if (img.naturalWidth > 0 && img.dataset.srcset) {
+          const next = img.cloneNode(false);
+          next.sizes = sizes; next.srcset = img.dataset.srcset;
+          if (img.dataset.src) next.src = img.dataset.src;
+          delete next.dataset.src;
+          try { await next.decode(); } catch { return; }
+          if (!current() || node.firstElementChild !== img
+            || sizes !== `${Math.max(1, Math.ceil(p.w * viewport.scale))}px`) return;
+          next.addEventListener('error', () => node.classList.add('broken'), { once: true });
+          img.replaceWith(next); p.img = next;
+          overview.replaceImage(node, next);
+          return;
+        }
+        if (img.dataset.srcset) { img.sizes = sizes; img.srcset = img.dataset.srcset; }
+        else p.loaded = true;
+        if (img.dataset.src) { img.src = img.dataset.src; delete img.dataset.src; }
+        try { await img.decode(); } catch {} // The tile's existing error placeholder is authoritative.
+      });
   }
 }
 
@@ -1287,6 +1440,7 @@ function updateSortDirection() {
 function setSort(key, direction = state.sort.direction) {
   if (state.spatialOn) return;
   rememberScope();
+  clearTrayReturn(); invalidatePreview();
   state.sort = { key, direction };
   document.getElementById('sort-key').value = key;
   updateSortDirection();
@@ -1295,7 +1449,7 @@ function setSort(key, direction = state.sort.direction) {
 }
 document.getElementById('sort-key').addEventListener('change', e => setSort(e.target.value));
 document.getElementById('sort-direction').addEventListener('click', () => setSort(state.sort.key, state.sort.direction === 'asc' ? 'desc' : 'asc'));
-document.getElementById('attribute-lens').addEventListener('change', e => brush.setPinned(e.target.value === 'none' ? null : e.target.value));
+document.getElementById('attribute-lens').addEventListener('change', e => { brush.setPinned(e.target.value === 'none' ? null : e.target.value); syncOverview(); });
 
 /* -------------------------------------------------------------- detail --- */
 
@@ -1318,11 +1472,22 @@ const PREVIEW_DWELL = 500;
 // to the pane starts by leaving a tile. The pane's own pointerenter cancels
 // this; the grace only has to outlast the gap between the two.
 const PREVIEW_LINGER = 320;
-let previewTimer = null, previewMedia = null;
+let previewTimer = null, previewMedia = null, previewPoint = null;
+function invalidatePreview() {
+  previewPoint = null;
+  endPreview();
+}
+
 
 function hoverPreview(clip, e) {
   if (!state.selected) return;                              // nothing to override outside Dive
   if (e && (e.buttons !== 0 || e.pointerType === 'touch')) return;  // a pan is not a hover
+  if (performance.now() < viewport.settlesAt && !state.spatialOn) return;
+  if (e) {
+    if (e.type !== 'pointermove') return;
+    if (previewPoint && Math.hypot(e.clientX - previewPoint.x, e.clientY - previewPoint.y) < 2) return;
+    previewPoint = { x: e.clientX, y: e.clientY };
+  }
   clearTimeout(previewTimer);
   if (clip.id === state.selected) { endPreview(); return; } // hovering home returns home
   if (state.preview === clip.id) return;
@@ -1366,13 +1531,55 @@ function commitPreview() {
 // Clicking a non-interactive part of it commits, so the pane itself is a target
 // for "yes, this one" without going back to the tile.
 el.detail.addEventListener('pointerenter', () => clearTimeout(previewTimer));
+el.detail.addEventListener('pointerdown', e => { if (e.target.closest('.detail-resize')) invalidatePreview(); });
 el.detail.addEventListener('pointerleave', () => { if (state.preview) hoverEnd(); });
 el.detail.addEventListener('click', (e) => {
   if (state.preview && !e.target.closest('a, button, .thumbs img')) commitPreview();
 });
 
+function itemSource(clip, pose = null, sourceNode = null) {
+  if (state.spatialOn) return { sourceRect: state.spatial?.originRectangle(clip), sourceSrc: clip.cover };
+  const hintedImage = sourceNode?.isConnected && sourceNode.querySelector('img');
+  if (hintedImage && !pose) return { source: hintedImage, sourceRect: hintedImage.getBoundingClientRect(),
+    sourceSrc: hintedImage.currentSrc || hintedImage.src || clip.cover };
+  // Background perspective is not flat world geometry. The lift retains its
+  // captured origin for exact return instead of borrowing a foreground copy.
+  if (pose && sourceNode?.classList.contains('bg')) return {};
+  const entries = [...state.positions].filter(([, t]) => t.clip.id === clip.id);
+  const r = el.stage.getBoundingClientRect(), camera = pose || viewport.visiblePose();
+  const found = entries.find(([key]) => state.tileEls.get(key) === sourceNode) || entries.find(([, t]) =>
+    t.x * camera.scale + camera.x >= 0 && t.x * camera.scale + camera.x < r.width &&
+    t.y * camera.scale + camera.y >= 0 && t.y * camera.scale + camera.y < r.height) || entries[0];
+  if (!found) return {};
+  const [key, t] = found, source = state.tileEls.get(key)?.querySelector('img');
+  return { source: pose ? null : source,
+    sourceRect: { left: r.left + camera.x + t.x * camera.scale, top: r.top + camera.y + t.y * camera.scale,
+      width: t.w * camera.scale, height: t.h * camera.scale },
+    sourceSrc: source?.currentSrc || source?.src || clip.cover };
+}
+function exposeReadingItem(clip, sourceNode = null) {
+  if (state.spatialOn || window.innerWidth <= 800 || sourceNode?.classList.contains('bg')) return;
+  const entries = [...state.positions].filter(([, t]) => t.clip.id === clip.id);
+  // Multi-valued grouping repeats one identity in several places. Expose the
+  // occurrence that lent its image to the reader, not its first other copy.
+  const p = (entries.find(([key]) => state.tileEls.get(key) === sourceNode) || entries[0])?.[1];
+  if (!p) return;
+  const stage = el.stage.getBoundingClientRect(), pane = el.detail.getBoundingClientRect();
+  const width = Math.max(120, pane.left - stage.left), scale = viewport.scale;
+  const left = viewport.x + p.x * scale, right = left + p.w * scale;
+  if (right > width - 16 || left < 16) {
+    viewport.panTo(width / 2 - (p.x + p.w / 2) * scale, viewport.y, { duration: 220 });
+  }
+}
 /** Commit a clip as the selection and show it. The only path that writes state.selected. */
-function openDetail(clip) {
+function openDetail(clip, { sourceNode = null } = {}) {
+  const origin = itemSource(clip, null, sourceNode);
+  if (!state.selected) state.detailReturn = { camera: viewport.visiblePose(), epoch: state.layoutEpoch,
+    focus: document.activeElement, sourceNode, selected: clip.id, width: window.innerWidth, height: window.innerHeight };
+  if (!state.spatialOn) viewport.fitted = false;
+  readerLift.cancel(); readerMedia.cancel();
+  state.spatial?.cancelHover?.();
+  previewPoint = null;
   endPreview({ silent: true });
   state.unresolvedFocus = null; state.detailMedia = null;
   state.selected = clip.id;
@@ -1380,10 +1587,14 @@ function openDetail(clip) {
   for (const [key, node] of state.bgTileEls) node.classList.toggle('selected', state.bgPositions.get(key)?.clip.id === clip.id);
   renderDetail(clip);
   detailPane.open();
+  const image = detailPane.content.querySelector(':scope > img');
+  if (image && !hydrating) void readerLift.open({ ...origin, image });
+  exposeReadingItem(clip, sourceNode);
 }
 
 /** Paint one clip into the pane. Says nothing about selection — a preview renders through here too. */
 function renderDetail(clip) {
+  readerMedia.cancel(); readerLift.cancel();
   const d = detailPane.content;
   d.replaceChildren();
 
@@ -1408,9 +1619,13 @@ function renderDetail(clip) {
   const cover = clip.detailCover || clip.cover || clip.media?.[0]?.src;
   if (cover) {
     const img = document.createElement('img');
-    img.src = cover;
     img.alt = '';
+    img.decoding = 'async';
+    img.draggable = false;
     d.append(img);
+    const origin = itemSource(clip);
+    void readerMedia.prepareImage(img, clip, { thumbnail: origin.sourceSrc || clip.cover });
+    if (order.length && at >= 0) readerMedia.prefetch([order[(at + 1) % order.length], order[(at - 1 + order.length) % order.length]]);
   }
 
   const h2 = document.createElement('h2');
@@ -1547,7 +1762,8 @@ function stepDetail(delta) {
   const p = [...state.positions.values()].find(t => t.clip.id === clip.id);
   if (!p) return;
   const r = el.stage.getBoundingClientRect(), s = viewport.scale;
-  viewport.panTo(r.width / 2 - (p.x + p.w / 2) * s, r.height / 2 - (p.y + p.h / 2) * s, { duration: 300 });
+  const width = Math.max(120, Math.min(r.width, el.detail.getBoundingClientRect().left - r.left));
+  viewport.panTo(width / 2 - (p.x + p.w / 2) * s, r.height / 2 - (p.y + p.h / 2) * s, { duration: 220 });
 }
 // Swipe across the detail pane steps through the review order (phones).
 { let start = null;
@@ -1557,10 +1773,18 @@ function stepDetail(delta) {
   el.detail.addEventListener('pointercancel', () => { start = null; }); }
 
 function closeDetail() {
+  const clip = state.clips.find(c => c.id === state.selected), back = state.detailReturn;
+  const recover = back && back.epoch === state.layoutEpoch && back.width === window.innerWidth && back.height === window.innerHeight;
+  endPreview();
+  if (clip) void readerLift.close({ ...itemSource(clip, recover && !state.spatialOn ? back.camera : null, back?.selected === clip.id ? back.sourceNode : null), image: detailPane.content.querySelector(':scope > img') });
+  else readerLift.cancel();
+  readerMedia.cancel(); previewPoint = null;
   endPreview({ silent: true });
   state.unresolvedFocus = null; state.detailMedia = null;
   detailPane.close();
-  state.selected = null;
+  state.selected = null; state.detailReturn = null;
+  if (recover && !state.spatialOn && !hydrating) viewport.restore(back.camera);
+  if (back?.focus?.isConnected && !hydrating) back.focus.focus?.({ preventScroll: true });
   for (const node of state.tileEls.values()) node.classList.remove('selected');
   for (const node of state.bgTileEls.values()) node.classList.remove('selected');
 }
@@ -1595,15 +1819,17 @@ el.search.addEventListener('input', () => {
 });
 
 el.group.addEventListener('change', () => {
+  clearTrayReturn(); invalidatePreview();
   state.arrangementOverride = null; state.layoutAspect = null;
   state.groupKey = el.group.value;
+  state.spatialDirty = true;
   if (state.spatialOn && state.spatial) {
     if (state.groupKey === 'none') state.spatial.showMountain();
     else state.spatial.showPiles(state.groupKey);
     saveViewState();
   }
-  render();
-  requestAnimationFrame(() => viewport.fit());
+  if (state.spatialOn) { state.flatDirty = true; updateReviewOrder(); }
+  else { render(); requestAnimationFrame(() => viewport.fit()); }
 });
 
 const panBehavior = document.getElementById('pan-behavior');
@@ -1633,6 +1859,7 @@ function zoomBy(factor) {
   else viewport.zoomBy(factor);
 }
 function fitWall() {
+  clearTrayReturn(); invalidatePreview();
   state.layoutAspect = null;
   if (state.spatialOn) state.spatial.fitView();
   else { setBackgroundRevealed(false); render(); viewport.fit(); }
@@ -1672,6 +1899,7 @@ window.addEventListener('keydown', (e) => {
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
     if (!state.spatialOn && viewport.undoEdge()) { e.preventDefault(); return; }
+    if (!state.spatialOn && returnFromTray()) { e.preventDefault(); return; }
     closeDetail(); el.search.blur(); return;
   }
   if (typing) return;
