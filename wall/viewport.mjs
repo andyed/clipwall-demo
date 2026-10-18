@@ -93,6 +93,13 @@ export class Viewport {
     });
   }
 
+  /** A direct zoom gesture is under way (a touch pinch, or an edge drag that
+   *  is enlarging the wall). Its writes are immediate, so settlesAt cannot say
+   *  when it lands; the gesture's end notifies onChange once more instead. */
+  get zooming() {
+    return !!this._pinch || (!!this._drag && this._edgePhase === 'zoom');
+  }
+
   /** Land any transition now: the next write is immediate. */
   _cancelZoom() { this._transition = 0; this.settlesAt = 0; }
 
@@ -219,6 +226,13 @@ export class Viewport {
     // Zooming out stops at Fit of what there is to show: a canvas of empty space says nothing.
     const floor = Math.max(MIN_SCALE, Math.min(this.scale, this.scaleFloor?.() ?? MIN_SCALE));
     const next = Math.min(MAX_SCALE, Math.max(floor, this.scale * factor));
+    // Clamped at the floor (or ceiling) the zoom cannot change, so it must not
+    // write at all. Re-anchoring at the same scale still moved the camera by
+    // rounding (~0.1 px through the eased visible pose), which cleared
+    // `fitted`, restarted the ease, and repainted the whole overview: ten
+    // zoom-out ticks at Fit cost 109 overview paints, ~27,000 draws and 28
+    // frames over 33 ms on the Music Atlas (2026-10-13).
+    if (Math.abs(next - this.scale) <= this.scale * 1e-9) return;
     let view = { x: px - cx * next, y: py - cy * next, scale: next };
     if (this.panMode !== 'free' && this.bounds) view = boundPan(view, { w: r.width, h: r.height }, this.bounds);
     this._transition = reducedMotion() ? 0 : duration;
@@ -368,13 +382,16 @@ export class Viewport {
     const end = (e) => {
       if (e.pointerType === 'touch' && this._touches.has(e.pointerId)) {
         this._touches.delete(e.pointerId);
+        const pinched = !!this._pinch;
         if (this._touches.size < 2) this._pinch = null;
         if (this.stage.hasPointerCapture?.(e.pointerId)) this.stage.releasePointerCapture(e.pointerId);
+        if (pinched && !this._pinch) this._schedule(); // the pinch has landed
       }
       if (!this._drag || this._drag.id !== e.pointerId) return;
       // Report drag distance so a click handler can tell a tap from a pan.
       this.lastDragDistance = this._drag.moved;
       const wasCaptured = this._drag.captured;
+      const edgeZoomed = this._edgePhase === 'zoom';
       this._drag = null;
       this.edge.reset();
       this._gestureStart = null;
@@ -383,6 +400,7 @@ export class Viewport {
       if (wasCaptured && this.stage.hasPointerCapture?.(e.pointerId)) {
         this.stage.releasePointerCapture(e.pointerId);
       }
+      if (edgeZoomed) this._schedule(); // the edge zoom has landed
     };
     this.stage.addEventListener('pointerup', end);
     this.stage.addEventListener('pointercancel', end);

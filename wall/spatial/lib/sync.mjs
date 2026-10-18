@@ -13,7 +13,8 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const UPSTREAM = process.env.MURIEL_ROOT
-  || path.join(process.env.HOME, 'Documents/dev/muriel/render_assets/_lib');
+  // A muriel checkout beside this repository; set MURIEL_ROOT for any other layout.
+  || path.resolve(HERE, '../../../../muriel/render_assets/_lib');
 const PULL = process.argv.includes('--pull');
 
 const digest = async (p) => createHash('sha1').update(await readFile(p)).digest('hex').slice(0, 12);

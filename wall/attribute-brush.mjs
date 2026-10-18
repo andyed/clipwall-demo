@@ -3,9 +3,10 @@
  *
  * The brush owns neither filtering nor sorting. It reads the current subset
  * and tile nodes from the wall, then leaves the wall's membership and camera
- * untouched. `valuesOf` is the same membership normalizer used by filtering.
+ * untouched. Value previews share the exact predicate used by filtering.
  */
-import { attributeModel, attributeMark, valuesOf } from './attributes.mjs';
+import { attributeModel, attributeMark } from './attributes.mjs';
+import { matchesFacet } from './context-clusters.mjs';
 export { attributeModel, attributeMark } from './attributes.mjs';
 
 const finite = value => Number.isFinite(value);
@@ -55,11 +56,12 @@ export function createAttributeBrush({
   getLabel = key => key,
   onSort = () => {}, // Reserved for host controls; brush never invokes it.
   onPinnedChange = () => {},
+  onActiveChange = () => {},
 } = {}) {
   if (!stage || !canvas) throw new TypeError('createAttributeBrush requires stage and canvas');
   const models = new Map();
   const bindings = [];
-  const state = { enabled: true, pinned: null, active: null };
+  const state = { enabled: true, pinned: null, pinnedValue: null, active: null };
   let legend = null;
   let destroyed = false;
   void onSort;
@@ -155,7 +157,8 @@ export function createAttributeBrush({
     }
     const footer = document.createElement('div');
     footer.className = 'brush-legend-foot';
-    const matchCount = value == null ? null : getClips().filter(clip => valuesOf(clip, model.key).includes(value)).length;
+    const requestedValues = value == null ? null : new Set([String(value)]);
+    const matchCount = requestedValues === null ? null : getClips().filter(clip => matchesFacet(clip, model.key, requestedValues)).length;
     text(footer, `${matchCount === null ? '' : `${matchCount} matches · `}${getClips().length} in view${missingCount ? ` · ${missingCount} missing` : ''}${state.pinned === model.key ? ' · pinned' : ''}`);
     if (model.multiValueRule) {
       footer.title = model.multiValueRule;
@@ -169,13 +172,12 @@ export function createAttributeBrush({
 
   const apply = (model, value = null) => {
     const requested = value == null ? null : String(value);
+    const requestedValues = requested === null ? null : new Set([requested]);
     for (const entry of getTiles() || []) {
       const tile = tileClip(entry);
       if (!tile) continue;
       const mark = attributeMark(tile.clip, model);
-      const memberValues = valuesOf(tile.clip, model.key);
-      const matches = requested === null || memberValues.includes(requested) ||
-        (model.key === 'captured' && memberValues.some(member => String(requested).startsWith(member)));
+      const matches = requested === null || matchesFacet(tile.clip, model.key, requestedValues);
       tile.node.classList.remove('brush-wash', 'brush-match', 'brush-miss', 'brush-focus', 'brush-unknown');
       tile.node.classList.add(requested === null ? 'brush-wash' : matches ? 'brush-match' : 'brush-miss');
       if (mark.missing) tile.node.classList.add('brush-unknown');
@@ -202,39 +204,43 @@ export function createAttributeBrush({
     canvas.dataset.brushMode = state.active.value === null ? 'distribution' : 'value';
     apply(model, state.active.value);
     renderLegend(model, state.active.value);
+    onActiveChange({ ...state.active, model });
   };
 
   const restorePinned = () => {
-    if (state.pinned) show(state.pinned);
+    if (state.pinned) show(state.pinned, state.pinnedValue);
     else {
       state.active = null;
       delete canvas.dataset.brushKey;
       delete canvas.dataset.brushMode;
       clearTiles();
       hideLegend();
+      onActiveChange(null);
     }
   };
 
   function clear() {
     const hadPinned = state.pinned !== null;
-    state.pinned = null;
+    state.pinned = null;state.pinnedValue = null;
     state.active = null;
     delete canvas.dataset.brushKey;
     delete canvas.dataset.brushMode;
     clearTiles();
     hideLegend();
     updateAllPressed();
+    onActiveChange(null);
     if (hadPinned) onPinnedChange(null);
   }
 
   const preview = (key, value = null) => show(key, value);
 
-  const setPinned = key => {
+  const setPinned = (key, value = null) => {
     const raw = key == null ? '' : cleanKey(key);
     const next = raw || null;
-    if (next === state.pinned) return;
-    state.pinned = next;
-    if (next) show(next);
+    const requested = next && value != null ? String(value) : null;
+    if (next === state.pinned && requested === state.pinnedValue) return;
+    state.pinned = next;state.pinnedValue = requested;
+    if (next) show(next,requested);
     else restorePinned();
     onPinnedChange(state.pinned);
   };
@@ -247,7 +253,8 @@ export function createAttributeBrush({
       state.active = null;
       delete canvas.dataset.brushKey;
       delete canvas.dataset.brushMode;
-    } else if (state.pinned) show(state.pinned);
+      onActiveChange(null);
+    } else if (state.pinned) show(state.pinned, state.pinnedValue);
   };
 
   const refresh = () => {
@@ -321,6 +328,9 @@ export function createAttributeBrush({
     return () => {
       button.removeEventListener('pointerenter', enter); button.removeEventListener('pointerleave', leave);
       button.removeEventListener('focus', focus); button.removeEventListener('blur', blur); button.removeEventListener('click', click);
+      const index = bindings.findIndex(item => item.binding === binding);
+      if (index !== -1) bindings.splice(index, 1);
+      if (binding.pointerOwned || binding.focusOwned) restorePinned();
     };
   };
 
@@ -344,16 +354,19 @@ export function createAttributeBrush({
     for (const item of bindings) if (item.binding.isHeading) updatePressed(item.binding.button, item.binding.key);
   };
   const originalSetPinned = setPinned;
-  const publicSetPinned = key => { originalSetPinned(key); updateAllPressed(); };
+  const publicSetPinned = (key,value=null) => { originalSetPinned(key,value); updateAllPressed(); };
 
   return {
     preview,
+    endPreview: restorePinned,
     clear,
     refresh,
     bindHeading,
     bindValue,
     setPinned: publicSetPinned,
     getPinned: () => state.pinned,
+    getPinnedValue: () => state.pinnedValue,
+    getActive: () => state.active ? { ...state.active, model:ensureModel(state.active.key) } : null,
     setEnabled,
     destroy() {
       if (destroyed) return;

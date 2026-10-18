@@ -1,15 +1,20 @@
 /**
  * Layout math for the wall. Pure functions — no DOM, no state.
  *
- * Two regimes:
- *   ungrouped → one justified-rows block, the whole wall
- *   grouped   → one block per facet value, compactly packed across the canvas
+ * Three regimes:
+ *   ungrouped  → one justified-rows block, the whole wall
+ *   grouped    → one block per facet value, packed as rows of blocks (strip treemap)
+ *   similarity → tiles at projection points, overlap removed (similarity-layout.mjs)
+ *   similarity grid → the same map snapped to index-time lattice cells
  *
  * Justified rows (rather than a fixed grid) because clippings arrive at wildly
  * different aspect ratios — a 3:1 banner and a 9:16 phone shot in the same
  * fixed grid either letterbox to mush or crop away the thing you clipped.
  * Justified rows preserve every aspect ratio and still give flush edges.
  */
+
+import { SIMILARITY, SIMILARITY_GRID, isSimilarity, similarityLayout, similarityGrid } from './similarity-layout.mjs';
+export { SIMILARITY, SIMILARITY_GRID, isSimilarity };
 
 const DEFAULTS = { targetH: 240, gap: 14, headerH: 52, blockGap: 64 };
 /** Height of a group block's heading band, in world units. */
@@ -107,7 +112,8 @@ export function naturalWallWidth(clips, opts = {}) {
 
 /** Group clips by a facet key; multi-valued keys place a clip in every group. */
 export function groupBy(clips, key) {
-  if (!key || key === 'none') return [{ label: '', clips }];
+  // The similarity map is an arrangement, not a grouping: one undivided set.
+  if (!key || key === 'none' || isSimilarity(key)) return [{ label: '', clips }];
 
   const buckets = new Map();
   const put = (label, clip) => {
@@ -127,57 +133,59 @@ export function groupBy(clips, key) {
   return [...buckets.entries()]
     .map(([label, items]) => ({ label, clips: items }))
     .sort((a, b) => key === 'captured' ? b.label.localeCompare(a.label)
+      : key === 'publication_period' ? a.label.localeCompare(b.label)
       : b.clips.length - a.clips.length || a.label.localeCompare(b.label));
 }
 
-/** Pack group rectangles along the lowest available skyline, filling the space
- * beside a tall group instead of reserving its full height for an entire row. */
+/**
+ * Pack group blocks as an order-preserving strip treemap (Bederson, Shneiderman
+ * & Wattenberg 2002): rows of blocks that each span the wall, every block as
+ * wide as its share of the row's area, so a row ends flush instead of leaving
+ * a hole beside a short group. A row closes when adding the next group would
+ * worsen the row's mean block aspect. Group order is reading order.
+ *
+ * Replaced skyline packing on 2026-10-13. Measured on the real corpora, the
+ * fraction of the screen covered by tiles after Fit (grouped by decade /
+ * capture month) rose from 52–60% to 79–83% at 1440x900, 2560x1440, 3840x2160
+ * and portrait; skyline left holes beside short blocks and a ragged right edge.
+ */
 function packGroups(groups, wallWidth, o) {
   const pad = o.blockPad ?? 14;
+  // Estimated block area: the tiles at target height plus the heading band and
+  // padding, which grow with the block's side, not its area.
+  const items = groups.map(g => {
+    const tilesArea = g.clips.reduce((s, c) => s + (aspectOf(c) * o.targetH + o.gap) * (o.targetH + o.gap), 0);
+    const side = Math.sqrt(tilesArea);
+    return { g, a: tilesArea + (o.headerH * 1.3 + pad * 2) * side };
+  });
+  const meanAspect = row => {
+    const W = wallWidth - o.blockGap * (row.length - 1), sum = row.reduce((s, r) => s + r.a, 0), h = sum / W;
+    return row.reduce((m, r) => { const w = W * r.a / sum; return m + Math.max(w / h, h / w); }, 0) / row.length;
+  };
   const tiles = [], blocks = [];
-  let skyline = [{ x: 0, y: 0, w: wallWidth + o.blockGap }];
-  let widest = 0, bottom = 0;
-
-  for (const group of groups) {
-    const oneRow = group.clips.reduce((sum, c) => sum + aspectOf(c), 0) * o.targetH
-      + o.gap * Math.max(0, group.clips.length - 1);
-    // A few groups can use full-width bands; compact mosaics suit the long tail.
-    const inner = Math.min(wallWidth - pad * 2, Math.max(o.minBlockWidth || 300,
-      Math.ceil(Math.min(oneRow, groups.length <= 4 ? wallWidth : naturalWallWidth(group.clips, o)))));
-    const { tiles: gt, height } = justify(group.clips, inner, o);
-    const w = inner + pad * 2, h = o.headerH + height + pad;
-    const footprint = w + o.blockGap;
-    let x = 0, y = Infinity;
-    for (let i = 0; i < skyline.length; i++) {
-      const left = skyline[i].x;
-      if (left + footprint > wallWidth + o.blockGap + 0.001) continue;
-      let top = 0;
-      for (let j = i; j < skyline.length && skyline[j].x < left + footprint; j++) {
-        top = Math.max(top, skyline[j].y);
-      }
-      if (top < y) { x = left; y = top; }
-    }
-    const right = x + footprint;
-    const next = [];
-    for (const span of skyline) {
-      if (span.x < x) next.push({ ...span, w: Math.min(span.w, x - span.x) });
-      if (span.x + span.w > right) {
-        const left = Math.max(right, span.x);
-        next.push({ x: left, y: span.y, w: span.x + span.w - left });
-      }
-    }
-    next.push({ x, y: y + h + o.blockGap, w: footprint });
-    skyline = next.sort((a, b) => a.x - b.x);
-    for (const t of gt) {
-      tiles.push({ ...t, group: group.label, x: t.x + x + pad, y: t.y + y + o.headerH });
-    }
-    // Typical cover height, so a renderer can compare label size to image size.
-    const tileH = gt.length ? gt.reduce((sum, t) => sum + t.h, 0) / gt.length : o.targetH;
-    blocks.push({ label: group.label, count: group.clips.length, x, y, w, h, tileH });
-    widest = Math.max(widest, x + w);
-    bottom = Math.max(bottom, y + h);
+  let y = 0, widest = 0, i = 0;
+  while (i < items.length) {
+    const row = [items[i++]];
+    while (i < items.length && meanAspect([...row, items[i]]) <= meanAspect(row)) row.push(items[i++]);
+    const W = wallWidth - o.blockGap * (row.length - 1), sum = row.reduce((s, r) => s + r.a, 0);
+    let x = 0, rowH = 0;
+    row.forEach((r, k) => {
+      // The last block takes the remainder so the row ends exactly at the wall edge.
+      const w = k === row.length - 1 ? wallWidth - x : Math.round(W * r.a / sum);
+      const inner = Math.max(o.minBlockWidth || 120, w - pad * 2);
+      const { tiles: gt, height } = justify(r.g.clips, inner, o);
+      const h = o.headerH + height + pad;
+      for (const t of gt) tiles.push({ ...t, group: r.g.label, x: t.x + x + pad, y: t.y + y + o.headerH });
+      // Typical cover height, so a renderer can compare label size to image size.
+      const tileH = gt.length ? gt.reduce((s2, t) => s2 + t.h, 0) / gt.length : o.targetH;
+      blocks.push({ label: r.g.label, count: r.g.clips.length, x, y, w: inner + pad * 2, h, tileH });
+      widest = Math.max(widest, x + inner + pad * 2);
+      rowH = Math.max(rowH, h);
+      x += w + o.blockGap;
+    });
+    y += rowH + o.blockGap;
   }
-  return { tiles, blocks, width: widest, height: bottom };
+  return { tiles, blocks, width: widest, height: Math.max(0, y - o.blockGap) };
 }
 
 /**
@@ -190,6 +198,10 @@ function packGroups(groups, wallWidth, o) {
 export function layout(clips, groupKey, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   if (!clips.length) return { tiles: [], blocks: [], width: 1, height: 1 };
+  // Places come from the index-time projection of opts.universe (the corpus),
+  // so a filter hides tiles instead of moving the survivors.
+  if (groupKey === SIMILARITY) return similarityLayout(clips, o, justify);
+  if (groupKey === SIMILARITY_GRID) return similarityGrid(clips, o, justify);
   const grouped = groupKey && groupKey !== 'none';
   const groups = grouped ? groupBy(clips, groupKey) : [];
   const aspect = clamp(Number(o.viewportAspect) || 1, 0.2, 5);

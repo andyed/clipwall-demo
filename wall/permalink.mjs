@@ -1,43 +1,7 @@
-/** Portable view contract, shared by the browser and immutable snapshot endpoint. */
-export const MAX_VIEW_BYTES = 4 * 1024 * 1024;
-export function canonical(value) {
-  return JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
-    ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v);
-}
-export function validateView(v) {
-  const fail = () => { throw new Error('Invalid or unsupported view link'); };
-  const obj = x => x && typeof x === 'object' && !Array.isArray(x);
-  const str = x => typeof x === 'string' && x.length <= 20000;
-  const num = x => Number.isFinite(x) && Math.abs(x) <= 1e9;
-  const vec = x => Array.isArray(x) && x.length === 3 && x.every(num);
-  if (!obj(v) || v.v !== 1 || v.layoutVersion !== 1 || !obj(v.corpus) || !str(v.corpus.id) || !str(v.corpus.revision)
-      || !obj(v.scope) || !str(v.scope.query) || !Array.isArray(v.scope.facets)
-      || !v.scope.facets.every(f => Array.isArray(f) && f.length === 2 && str(f[0]) && Array.isArray(f[1]) && f[1].every(str))
-      || !(v.scope.branches === null || Array.isArray(v.scope.branches) && v.scope.branches.every(b => obj(b) && str(b.label) && Array.isArray(b.keys) && b.keys.every(str)))
-      || !obj(v.presentation) || !['flat', '3d'].includes(v.presentation.mode) || !str(v.presentation.group)
-      || !['free', 'bounded', 'edge'].includes(v.presentation.pan)
-      || !(v.presentation.sort === undefined || obj(v.presentation.sort) && str(v.presentation.sort.key) && ['asc', 'desc'].includes(v.presentation.sort.direction))
-      || !obj(v.flat) || !obj(v.flat.view) || !['x', 'y', 'scale'].every(k => num(v.flat.view[k]))
-      || v.flat.view.scale < .015 || v.flat.view.scale > 6 || typeof v.flat.view.fitted !== 'boolean'
-      || !num(v.flat.aspect) || v.flat.aspect <= 0 || !obj(v.flat.stage) || !['w', 'h'].every(k => num(v.flat.stage[k]) && v.flat.stage[k] > 0)
-      || !obj(v.ui) || typeof v.ui.rail !== 'boolean' || typeof v.ui.context !== 'boolean'
-      || !(v.ui.lens === undefined || v.ui.lens === null || str(v.ui.lens))
-      || !(v.ui.mediaSource === undefined || v.ui.mediaSource === null || str(v.ui.mediaSource))
-      || !(v.ui.scopeBar === undefined || typeof v.ui.scopeBar === 'boolean')
-      || !(v.ui.focus === null || str(v.ui.focus)) || !(v.ui.detailWidth === null || num(v.ui.detailWidth) && v.ui.detailWidth > 0 && v.ui.detailWidth <= 1)) fail();
-  if (v.spatial !== null) {
-    const s = v.spatial;
-    if (!obj(s) || !['mountain', 'piles'].includes(s.mode) || !obj(s.arrangement) || s.arrangement.version !== 1
-        || !Array.isArray(s.arrangement.piles) || !s.arrangement.piles.every(p => obj(p) && str(p.label) && num(p.u) && num(p.v)
-          && Array.isArray(p.keys) && p.keys.every(str) && (p.w === undefined || num(p.w) && p.w > 0) && (p.h === undefined || num(p.h) && p.h > 0))
-        || !Number.isInteger(s.spread) || s.spread < -1 || s.spread >= s.arrangement.piles.length
-        || !vec(s.position) || !vec(s.target) || typeof s.fitted !== 'boolean'
-        || !num(s.aspect) || s.aspect <= 0 || !(s.selection === null || str(s.selection))) fail();
-  }
-  if (v.presentation.mode === '3d' && !v.spatial) fail();
-  if (new TextEncoder().encode(canonical(v)).length > MAX_VIEW_BYTES) throw new Error('View exceeds the 4 MiB limit');
-  return v;
-}
+import { MAX_VIEW_BYTES, canonical, validateView } from './view-schema.mjs';
+import { applyViewIntent, stripViewIntent } from './view-intent.mjs';
+export { MAX_VIEW_BYTES, canonical, validateView } from './view-schema.mjs';
+
 export function encodeView(v) {
   const bytes = new TextEncoder().encode(canonical(validateView(v)));
   let binary = ''; for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
@@ -55,18 +19,26 @@ export async function viewDigest(v) {
 
 /** URL updates share one serialized pipeline. Inline fallback is immediately
  * current; reference URLs are advertised only after durable server readback. */
-export function createPermalinks({ capture, restore, notice, onHistory }) {
-  let snapshotsAbsent = false; // the snapshot endpoint is absent: static hosting
+export function createPermalinks({ capture, restore, notice, onHistory, snapshots = true }) {
+  // The snapshot endpoint is absent: static hosting, or a collection document,
+  // whose views must not be stored in whatever instance happens to serve the page.
+  let snapshotsAbsent = !snapshots;
   let ready = false, blocked = false, restoring = false, last = '', lastSemantic = '', generation = 0;
-  let pointerActive = false;
+  let pointerActive = false, deferredIntent = false;
   window.addEventListener('pointerdown', () => { pointerActive = true; }, true);
   for (const event of ['pointerup', 'pointercancel', 'blur']) window.addEventListener(event, () => { pointerActive = false; }, true);
   let candidate = '', since = 0, queuedRestore = Promise.resolve(), pending = Promise.resolve();
   const cache = new Map();
-  const semantic = v => canonical({ scope: v.scope, presentation: v.presentation, focus: v.ui.focus, lens: v.ui.lens ?? null });
+  const semantic = v => canonical({ scope: v.scope, presentation: v.presentation, focus: v.ui.focus, lens: v.ui.lens ?? null, highlight: v.ui.highlight ?? null });
   const read = async () => {
     const p = new URLSearchParams(location.hash.slice(1));
-    if (!p.has('s') && !p.has('ref')) return null;
+    if (!p.has('s') && !p.has('ref')) {
+      const baseline = capture();
+      deferredIntent = !baseline && stripViewIntent(location.href).href !== new URL(location.href).href;
+      if (deferredIntent) return null; // retry once a hidden/unmeasurable wall has a real stage
+      return applyViewIntent(location.href, baseline);
+    }
+    deferredIntent = false;
     if (p.get('v') !== '1' || p.has('s') === p.has('ref')) throw new Error('Unsupported view link format');
     if (p.has('s')) return decodeView(p.get('s'));
     const id = p.get('ref'); if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Invalid snapshot identifier');
@@ -76,9 +48,9 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
     if (await viewDigest(view) !== id) throw new Error('View snapshot integrity check failed');
     cache.set(canonical(view), id); return view;
   };
-  const urlFor = fragment => { const u = new URL(location.href); u.hash = fragment; return u.href; };
+  const urlFor = fragment => { const u = stripViewIntent(location.href); u.hash = fragment; return u.href; };
   const flush = async (force = false) => {
-    if (!ready || restoring || blocked) return pending;
+    if (!ready || restoring || blocked || deferredIntent) return pending;
     const raw = capture();
     if (!raw) return pending;   // nothing measurable yet; the poller comes back
     const v = validateView(raw), text = canonical(v);
@@ -97,7 +69,7 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
     }
     onHistory();
     if (encoded.length <= 6000 || cache.has(text)) { notice(''); return; }
-    // A static host has no snapshot service: the inline link is the link. Stay quiet after the first 404/405.
+    // A static host has no snapshot service: keep the full inline link quietly.
     if (snapshotsAbsent && !inlineFailed) { notice(''); return; }
     notice(inlineFailed ? 'Saving large view… the address bar is not current yet.' : 'Saving compact link… full view is already in the address bar.');
     pending = (async () => {
@@ -107,7 +79,8 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
         // sub-path and answers 403 — not 404 — for /api/… above it. Without
         // this the latch never sets, so every large view retries a POST that
         // cannot succeed and shows a notice for a service that is simply absent.
-        if ([403, 404, 405].includes(res.status) && !inlineFailed) { snapshotsAbsent = true; if (generation === stamp) notice(''); return; }
+        // Python's documented static preview server answers 501 for POST.
+        if ([403, 404, 405, 501].includes(res.status) && !inlineFailed) { snapshotsAbsent = true; if (generation === stamp) notice(''); return; }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { id } = await res.json();
         if (id !== await viewDigest(v)) throw new Error('snapshot identifier mismatch');
@@ -126,12 +99,14 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
   const load = async () => {
     restoring = true; generation++;
     try {
+      const saved = new URLSearchParams(location.hash.slice(1));
+      const intent = !saved.has('s') && !saved.has('ref');
       const view = await read();
-      if (view) await restore(view);
+      if (view) await restore(view, { intent });
       blocked = false;
       const snap = capture();
       last = snap ? canonical(snap) : ''; lastSemantic = snap ? semantic(snap) : ''; candidate = last;
-      if (!view) last = '';
+      if (!view || intent) last = '';
     } catch (err) { blocked = true; notice(`Could not restore link: ${err.message}. Use “New view” to leave this link.`); }
     finally { restoring = false; onHistory(); }
   };
@@ -142,9 +117,19 @@ export function createPermalinks({ capture, restore, notice, onHistory }) {
   });
   // Poll the settled canonical state, including spatial gestures and detail
   // resizing, rather than depending on a second collection of control values.
+  // A gesture in progress is the stage's .dragging or the body's .detail-resizing.
+  // Checking those two elements, not querySelector over the document: with the
+  // 3D cards mounted the scan walked ~9,600 nodes per tick, 9 ms per 2 s idle.
+  const stage = document.getElementById('stage');
+  const gesturing = () => stage?.classList.contains('dragging') || document.body.classList.contains('detail-resizing');
   setInterval(() => {
-    if (!ready || restoring || blocked || pointerActive || document.querySelector('.dragging, .detail-resizing')) return;
+    if (!ready || restoring || blocked || pointerActive || gesturing()) return;
     try {
+      if (deferredIntent) {
+        if (!capture()) return;
+        restoring = true; queuedRestore = queuedRestore.then(load).then(() => flush().catch(err => notice(err.message)));
+        return;
+      }
       const snap = capture();
       if (!snap) return;
       const now = canonical(snap);

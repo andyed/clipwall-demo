@@ -1,4 +1,4 @@
-/* clipwall — phosphor-on-near-black, matching the Psychodeli+ in-app surface.
+/* wunderkammer — phosphor-on-near-black, matching the Psychodeli+ in-app surface.
  *
  * Contrast floor is 8:1 on every readable string, measured against the actual
  * composited background rather than against the page. The tile caption is the
@@ -216,6 +216,34 @@ html, body {
   .chip[data-share] { transition: background-image 0.18s ease-out; }
 }
 
+/* Facet discovery uses stable rows: counts share one explicit denominator and
+   local value search never changes the collection. Existing detail chips keep
+   their compact treatment. */
+.rail { overflow-x: hidden; }
+.facet-count-guide { margin-bottom: 18px; font-size: 16px; font-weight: 500; color: var(--muted); }
+.facet-count-guide summary { cursor: pointer; min-height: 44px; }
+.facet-count-guide p { margin: 6px 0 0; }
+.rail .facet h3 { display: flex; align-items: center; gap: 6px; font-size: 16px; letter-spacing: 0; text-transform: none; }
+.rail .facet-heading { flex: 1; min-width: 0; min-height: 44px; text-align: left; font: inherit; overflow-wrap: anywhere; }
+.facet-clear { flex: 0 0 40px; min-height: 44px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font-family: inherit; font-size: 20px; line-height: 1; cursor: pointer; }
+.facet-clear:disabled { visibility: hidden; }
+.facet-search { width: 100%; height: 44px; margin: 0 0 8px; padding: 8px; font-family: inherit; font-size: 16px; font-weight: 500; line-height: 1.3; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.facet-search::placeholder { color: var(--muted); opacity: 1; }
+.rail .chips { display: grid; gap: 5px; }
+.rail .chip { width: 100%; min-height: 44px; padding: 6px; gap: 4px; border-radius: 6px; font-size: 16px; font-weight: 500; line-height: 1.35; text-align: left; }
+.rail .facet-check { flex: 0 0 14px; font-size: 16px; }
+.rail .facet-value { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.rail .chip .n { flex-shrink: 0; font-size: 16px; white-space: nowrap; }
+.rail .chip[data-share="none"] .n { text-decoration: none; } /* zero is an explicit count */
+.rail .chip-more { margin-top: 7px; justify-content: center; }
+.rail .chip-more[hidden], .facet-search[hidden], .facet-status[hidden] { display: none; }
+.facet-status { margin: 7px 0; color: var(--muted); font-size: 16px; font-weight: 500; }
+.facet-clear:focus-visible, .facet-search:focus-visible, .facet-count-guide summary:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
+.scope-facet { display: inline-flex; align-items: center; gap: 6px; }
+.scope-query { margin-right: 6px; }
+.scope-value, .scope-query { color: var(--text); }
+.empty .btn { min-height: 44px; padding: 8px 12px; font-size: 16px; }
+
 /* ---------- stage ---------- */
 
 .stage {
@@ -253,7 +281,9 @@ html, body {
   left: 0;
   overflow: hidden;
   border-radius: 5px;
-  background: var(--panel-2);
+  /* --tile-tint: the image's dominant colour, set in buildTile() when the
+   * corpus carries a palette; shown until the image paints over it. */
+  background: var(--tile-tint, var(--panel-2));
   border: 1px solid rgba(255, 255, 255, 0.09);
   /* layout-motion.mjs bounds position/scale animation to visible cards.
    * A width/height transition is a layout on every
@@ -275,7 +305,7 @@ html, body {
   height: 100%;
   object-fit: cover;
   display: block;
-  background: var(--panel-2);
+  background: var(--tile-tint, var(--panel-2));
 }
 
 /* Text-only clips still need to read as something. */
@@ -320,9 +350,12 @@ html, body {
   display: none;
 }
 
-/* Semantic zoom: captions are noise when zoomed out and context when zoomed in. */
-.canvas.z-far .cap { display: none; }
-.canvas.z-near .cap .m { display: block; }
+/* Semantic zoom: captions are noise when zoomed out and context when zoomed in.
+ * The tier is per tile, set when a zoom lands on the tiles in view and on every
+ * other tile as it is revealed (wall.mjs applyCaptionTier); a canvas-level class
+ * restyled the whole wall in one frame. */
+.tile.z-far .cap { display: none; }
+.tile.z-near .cap .m { display: block; }
 
 /* ---------- background plane ---------- */
 
@@ -588,6 +621,16 @@ body.detail-resizing, body.detail-resizing * { cursor: col-resize !important; us
   font-weight: 600;
 }
 
+/* Arrangement icons: a segmented group beside the grouping select. Glyphs are
+   --text on --panel-2; the pressed one is --accent-on on the solid accent fill. */
+.arrange { display: inline-flex; }
+.arrange[hidden], .arrange .btn[hidden] { display: none; }
+.arrange .btn { padding: 0 8px; border-radius: 0; margin-left: -1px; display: inline-grid; place-items: center; }
+.arrange .btn:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+.arrange .btn:last-child { border-radius: 0 6px 6px 0; }
+.arrange svg { width: 16px; height: 16px; fill: currentColor; }
+.arrange .btn[aria-pressed="true"] { background: rgb(var(--accent-rgb)); border-color: rgb(var(--accent-rgb)); color: var(--accent-on); }
+
 /* Derived image colors: swatches supplement explicit hex labels. */
 .palette { display: flex; flex-wrap: wrap; gap: 8px 12px; margin: 12px 0; }
 .palette span { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
@@ -660,7 +703,8 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
 /* One glyph row; the header height is measured into --bar-h. */
 .bar { height: auto; display: block; padding: 0; }
 .main-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 14px; min-height: 56px; }
-.main-controls .select { max-width: 200px; min-width: 96px; }
+.main-controls .select { max-width: 160px; min-width: 96px; }   /* 160, not 200: room for the arrangement icons */
+.main-controls .search { flex-basis: 240px; }
 .main-controls .btn { font-size: 16px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 /* The lens legend is an overlay over the stage, so revealing it never changes
@@ -701,4 +745,35 @@ body.detail-open .scope-bar, body.detail-open .context-clusters { right: var(--d
  * a laptop keeps the lens; a phone has no hover to brush with. */
 @media (max-width: 700px) and (hover: none) {
   #attribute-lens, .review-tip { display: none; }
+}
+
+/* Duplicates collapsed into this tile by the server (lib/dedupe.mjs).
+   --text is 16.9:1 and --muted 10.5:1 on --panel (see the header). */
+.detail .also-at { margin: 12px 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.detail .also-at summary { cursor: pointer; color: var(--text); }
+.detail .also-at ul { margin: 8px 0 0; padding-left: 18px; }
+.detail .also-at a { color: var(--text); }
+
+/* Aisle uses the same lens and scope controls as the flat wall. */
+.btn#view-aisle.on { background:rgb(var(--accent-rgb)); color:var(--accent-on); border-color:rgb(var(--accent-rgb)); }
+#view-aisle,#copy-live-view { min-width:44px; }
+#lens-value { position:absolute; top:calc(100% + 6px); right:0; pointer-events:auto; min-height:44px; max-width:100%; font-size:16px; }
+#lens-value[hidden] { display:none; }
+body[data-view-mode=aisle] .review-tip { width:min(440px,calc(100% - 24px)); }
+body[data-view-mode=aisle] .review-tip[data-brush-active] { height:auto; }
+body[data-view-mode=aisle] .review-tip .brush-legend { position:relative; padding:10px; min-height:72px; }
+body[data-view-mode=aisle] .review-tip .brush-legend,
+body[data-view-mode=aisle] .review-tip .brush-legend-foot,
+body[data-view-mode=aisle] .review-tip .brush-key { font-size:16px; }
+@media (max-width:700px) and (hover:none) {
+  .main-controls { padding-block:4px; }
+  .main-controls .zoomctl, #copy-view, #copy-live-view { order:1; }
+  /* The view and zoom buttons share a row with the two link buttons. When they
+   * outgrow it (the floating space's ✺ added one), the group scrolls sideways
+   * instead of pushing ↗ onto a fourth header row. */
+  .main-controls .zoomctl { flex:1 1 0; min-width:200px; overflow-x:auto; scrollbar-width:none; }
+  #view-aisle,#copy-live-view { min-height:44px; }
+  body[data-view-mode=aisle] #attribute-lens { display:block; }
+  body[data-view-mode=aisle] .review-tip[data-brush-active] { display:block; }
+  #lens-value { max-width:150px; }
 }

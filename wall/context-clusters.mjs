@@ -5,11 +5,15 @@ export function valuesOf(clip, key) {
   return (Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(String)
     .map(value => key === 'captured' ? value.slice(0, 7) : value);
 }
+/** Shared OR-within-facet predicate, including captured-date prefix semantics. */
+export function matchesFacet(clip, key, values) {
+  return !values.size || valuesOf(clip, key).some(value =>
+    key === 'captured' ? [...values].some(want => value.startsWith(want)) : values.has(value));
+}
 export function matchesFilters(clip, query, active) {
   const hay = [clip.title, clip.note, clip.source, clip.url, ...(clip.tags || [])].join(' ').toLowerCase();
   if (!query.trim().toLowerCase().split(/\s+/).every(term => hay.includes(term))) return false;
-  return [...active].every(([key, values]) => !values.size || valuesOf(clip, key).some(value =>
-    key === 'captured' ? [...values].some(want => value.startsWith(want)) : values.has(value)));
+  return [...active].every(([key, values]) => matchesFacet(clip, key, values));
 }
 export function filterScope(clips, { query, active, branches }) {
   const keys = branches === null ? null : new Set(branches.flatMap(branch => branch.keys));

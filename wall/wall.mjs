@@ -1,5 +1,5 @@
 /**
- * clipwall — a pannable, zoomable wall of visual web excerpts.
+ * wunderkammer — a pannable, zoomable wall of visual web excerpts.
  *
  * Reads a normalized clip index from /api/clips (whatever store the adapter
  * happens to be reading) and renders it as a filterable canvas. It never
@@ -13,24 +13,37 @@
 
 import { sortClips } from './attributes.mjs';
 import { createAttributeBrush } from './attribute-brush.mjs';
+import { buildFacetModel } from './facet-model.mjs';
+import { createFacetRail } from './facet-rail.mjs';
 import { createPermalinks, canonical } from './permalink.mjs';
-import { clipKey, filterScope, chooseCluster, contextClusters, valuesOf } from './context-clusters.mjs';
-import { layout, groupBy, frameAround, HEADER_H } from './layout.mjs';
+import { targetedViewURL } from './view-intent.mjs';
+import { clipKey, filterScope, chooseCluster, contextClusters, valuesOf, matchesFacet } from './context-clusters.mjs';
+import { layout, groupBy, frameAround, HEADER_H, SIMILARITY, SIMILARITY_GRID, isSimilarity } from './layout.mjs';
+import { hasProjection, hasCell } from './similarity-layout.mjs';
 import { Viewport } from './viewport.mjs';
 import { createDetailPane } from './detail-pane.mjs';
+import { zoomDetailCandidate } from './zoom-detail.mjs';
 import { createReaderLift, createReaderMedia } from './reader-lift.mjs';
-import { OverviewSurface } from './overview-surface.mjs';
-import { animateLayout, captureLayoutMotion } from './layout-motion.mjs';
+import { OverviewSurface, overviewSource, loadOverviewImage } from './overview-surface.mjs';
+import { spriteCovers, isSpriteSource } from './sprite-covers.mjs';
+import { animateLayout, captureLayoutMotion, movingNodes } from './layout-motion.mjs';
 import { createImageWork } from './image-work.mjs';
 import { ViewStateStore, mergePileState } from './view-state.mjs';
+import { perf } from './instrument.mjs';
+import { collectionSource, loadCollection, collectionViewState, notifyEmbedder, FROM_PARENT } from './collection-source.mjs';
+import { setProxyAvailable } from './media-policy.mjs';
+import { AXES, axisDimensions } from './float-space.mjs';
+import { NEUTRAL_NOUNS, collectionNouns, counted } from './nouns.mjs';
 
-/** Facets that exist for layout, not for browsing. */
+/** Facets hidden from browsing controls, including instance-specific additions. */
 const FACET_BLOCKLIST = new Set(['dims', 'media', 'cover']);
-/** Chips per facet before the tail is handed to search. */
+/** Initial page of values; local facet search reaches the complete vocabulary. */
 const FACET_CHIP_LIMIT = 24;
 let facetOrder = ['tags', 'source', 'kind', 'captured'];
 
 const state = {
+  // What the collection calls its items (wall/nouns.mjs); set when the corpus loads.
+  nouns: NEUTRAL_NOUNS,
   clips: [],
   facets: {},
   filtered: [],
@@ -55,9 +68,12 @@ const state = {
   sort: { key: 'none', direction: 'asc' },
   selected: null,
   spatial: null,       // lazily constructed SpatialView
-  spatialOn: false,
+  mode: 'flat',
+  get spatialOn() { return this.mode !== 'flat'; },
+  aisle: null, aisleSnapshot: null,
+  float: null, floatSnapshot: null,
   spatialLoading: false,
-  flatDirty: false, spatialDirty: false,
+  flatDirty: false, spatialDirty: false, aisleDirty: true, floatDirty: true,
   detailReturn: null, trayReturn: null,
   clipKey: null,
   viewState: new ViewStateStore(),
@@ -73,6 +89,10 @@ const el = {
   stage: document.getElementById('stage'),
   spHost: document.getElementById('sp-host'),
   view3d: document.getElementById('view-3d'),
+  viewAisle: document.getElementById('view-aisle'),
+  aisleHost: document.getElementById('aisle-host'),
+  viewFloat: document.getElementById('view-float'),
+  floatHost: document.getElementById('float-host'),
   canvas: document.getElementById('canvas'),
   rail: document.getElementById('rail'),
   search: document.getElementById('search'),
@@ -87,16 +107,37 @@ const viewport = new Viewport(el.stage, el.canvas, onViewportChange);
 const readerLift = createReaderLift();
 const readerMedia = createReaderMedia();
 const imageWork = createImageWork();
-const overview = new OverviewSurface(el.stage);
-let overviewFrame = 0, layoutMotionUntil = 0;
-function syncOverview() {
+// A cover that exists only as sprite-sheet cells has no file for the
+// overview's per-source loader; the sheets crop it instead.
+const overview = new OverviewSurface(el.stage, {
+  loadImage: (src, options) => isSpriteSource(src) ? spriteCovers.overviewImage(src, options) : loadOverviewImage(src, options) });
+/** Device pixels a draw of `cssPx` needs, at the DPR the overview also caps at. */
+const devicePx = cssPx => cssPx * Math.min(Math.max(1, window.devicePixelRatio || 1), 2);
+// A sheet level that failed to load withdraws its promise to cover tiles;
+// re-run image loading so those tiles fetch their own files instead.
+overview.onSheetsChange = level => { if (level.state === 'failed') updateVisibility(); };
+// Gauges for the perf probe, read only at snapshot time (no per-frame cost).
+perf.provide('flat', () => ({ tiles: state.tileEls.size, bgTiles: state.bgTileEls.size, filtered: state.filtered.length,
+  corpus: state.clips.length, scale: Number(viewport.scale.toFixed(3)), domNodes: document.getElementsByTagName('*').length }));
+perf.provide('images', () => ({ queued: imageWork.pending, decoding: imageWork.running }));
+perf.provide('overview', () => ({ draws: overview.draws ?? 0, active: !!overview.active, atlas: overview.atlas?.stats ?? null }));
+let overviewFrame = 0, layoutMotionUntil = 0, layoutMotionToken = 0;
+// The stage's size for the overview, kept until the stage ResizeObserver clears
+// it. Measuring each frame of camera motion forced a style and layout pass
+// right after the camera wrote its transform (9-10 ms per gesture).
+let stageSize = null;
+function syncOverview() { perf.span('overview/sync', syncOverviewNow); }
+function syncOverviewNow() {
   cancelAnimationFrame(overviewFrame); overviewFrame = 0;
-  const enabled = !state.spatialOn && !el.canvas.hasAttribute('data-brush-key')
-    && performance.now() >= layoutMotionUntil;
-  overview.setEnabled(enabled);
+  const enabled = !state.spatialOn && !el.canvas.hasAttribute('data-brush-key');
+  // Leaving for the 3D view hides the flat stage, so its images can return at
+  // once; a lens keeps the desk on screen and hands tiles back gradually.
+  overview.setEnabled(enabled, { gradual: !state.spatialOn });
   if (!enabled) return;
-  const rect = el.stage.getBoundingClientRect(), moving = performance.now() < viewport.settlesAt;
-  overview.setViewport(viewport.visiblePose(), { width: rect.width, height: rect.height, moving });
+  if (!stageSize) { const r = el.stage.getBoundingClientRect(); stageSize = { width: r.width, height: r.height }; }
+  // Pinch and edge zoom have no ease end, so `zooming` marks them as motion too.
+  const moving = performance.now() < viewport.settlesAt || viewport.zooming;
+  overview.setViewport(viewport.visiblePose(), { ...stageSize, moving });
   if (moving) overviewFrame = requestAnimationFrame(syncOverview);
 }
 // The smallest useful scale: Fit of the foreground, or of the foreground plus
@@ -112,15 +153,16 @@ let hydrating = false, links;
 const brush = createAttributeBrush({
   canvas: el.canvas, stage: el.stage,
   legendHost: document.getElementById('review-tip'),
-  getTiles: () => [...state.tileEls].map(([key, node]) => ({ node, clip: state.positions.get(key)?.clip })).filter(t => t.clip),
+  getTiles: () => state.mode === 'aisle' || state.mode === 'float' ? [] : [...state.tileEls].map(([key, node]) => ({ node, clip: state.positions.get(key)?.clip })).filter(t => t.clip),
   getClips: () => state.filtered, getSort: () => state.sort,
   getLabel: key => state.facetLabels[key] || (key === 'title' ? 'Title' : key),
   onSort: (key, direction) => setSort(key, direction),
-  onPinnedChange: key => { document.getElementById('attribute-lens').value = key || 'none'; },
+  onPinnedChange: key => { document.getElementById('attribute-lens').value = key || 'none'; syncLensValue(); },
+  onActiveChange: active => { if(state.mode==='aisle')state.aisle?.setLens(active); },
 });
 new MutationObserver(syncOverview).observe(el.canvas, { attributes: true, attributeFilter: ['data-brush-key', 'data-brush-mode'] });
 const header = document.querySelector('.bar');
-new ResizeObserver(() => document.documentElement.style.setProperty('--bar-h', `${header.getBoundingClientRect().height}px`)).observe(header);
+new ResizeObserver(() => perf.span('resize/bar', () => document.documentElement.style.setProperty('--bar-h', `${header.getBoundingClientRect().height}px`))).observe(header);
 const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 function linkNotice(message) {
   document.getElementById('link-message').textContent = message;
@@ -149,16 +191,24 @@ function captureView() {
   }
   return { v: 1, layoutVersion: 1, corpus: state.corpus,
     scope: { query: state.query, facets: [...state.active].filter(([, v]) => v.size).map(([k, v]) => [k, [...v].sort()]).sort(([a], [b]) => a.localeCompare(b)), branches: state.branches },
-    presentation: { mode: state.spatialOn ? '3d' : 'flat', group: state.groupKey, pan: viewport.panMode, sort: { ...state.sort } },
+    presentation: { mode: state.mode, group: state.groupKey, pan: viewport.panMode, sort: { ...state.sort } },
     flat: { view: { ...viewport.snapshot(), ...(state.flatDirty ? { fitted: true } : {}) }, stage: { w: r.width, h: r.height }, aspect: state.renderAspect },
     spatial,
-    ui: { lens: brush.getPinned(), mediaSource: state.detailMedia, rail: !el.rail.classList.contains('hidden'), context: state.contextVisible, scopeBar: !document.getElementById('scope-bar').hidden,
+    ...((state.aisleSnapshot || state.aisle?.captureView()) ? {aisle:state.aisleSnapshot || state.aisle?.captureView()} : {}),
+    ...((state.floatSnapshot || state.float?.captureView()) ? {float:state.floatSnapshot || state.float?.captureView()} : {}),
+    ui: { lens: brush.getPinned(), ...(brush.getPinnedValue()!==null?{highlight:{key:brush.getPinned(),value:brush.getPinnedValue()}}:{}), mediaSource: state.detailMedia, rail: !el.rail.classList.contains('hidden'), context: state.contextVisible, scopeBar: !document.getElementById('scope-bar').hidden,
       focus: state.clips.find(c => c.id === state.selected) ? clipKey(state.clips.find(c => c.id === state.selected)) : state.unresolvedFocus,
       detailWidth: Number.isFinite(preferred) ? Math.min(1, preferred / window.innerWidth) : null },
   };
 }
-async function restoreView(spec) {
+async function restoreView(spec, { intent = false } = {}) {
   if (spec.corpus.id !== state.corpus.id) throw new Error('This link belongs to a different corpus');
+  // An axis this collection cannot carry is refused, never silently replaced by a default.
+  if (spec.float?.arrangement === 'axes' && spec.float.axes) {
+    const offered = new Set(axisDimensions(state.clips, attributeKeys(), key => state.facetLabels[key]).map(d => d.id));
+    const bad = AXES.find(axis => spec.float.axes[axis] !== undefined && !offered.has(spec.float.axes[axis]));
+    if (bad) throw new Error(`${bad}=${spec.float.axes[bad]} is not a dimension this collection can place on an axis`);
+  }
   hydrating = true; document.body.inert = true; document.body.dataset.restoring = 'true'; cancelAnimationFrame(filterFrame); viewport.resetEdge();
   const warnings = [];
   if (spec.corpus.revision !== state.corpus.revision) warnings.push('Corpus changed since this link was made');
@@ -171,13 +221,16 @@ async function restoreView(spec) {
     state.query = spec.scope.query; state.active = new Map(spec.scope.facets.map(([k, v]) => [k, new Set(v)]));
     state.branches = structuredClone(spec.scope.branches);
     state.sort = spec.presentation.sort || { key: 'none', direction: 'asc' };
-    brush.clear(); brush.setPinned(spec.ui.lens || null);
+    brush.clear(); brush.setPinned(spec.ui.lens || null, spec.ui.highlight?.value ?? null);
+    state.aisleSnapshot=spec.aisle || null;
+    state.floatSnapshot=spec.float || null;
     buildReviewControls();
     state.groupKey = spec.presentation.group; el.group.value = state.groupKey;
     if (el.group.value !== state.groupKey) { const option = document.createElement('option'); option.value = state.groupKey; option.textContent = state.groupKey; el.group.append(option); el.group.value = state.groupKey; }
     state.arrangementOverride = spec.spatial ? { ...spec.spatial.arrangement, mode: spec.spatial.mode } : null;
-    el.search.value = state.query; buildFacetRail();
+    el.search.value = state.query;
     el.rail.classList.toggle('hidden', !spec.ui.rail); el.stage.classList.toggle('full', !spec.ui.rail);
+    document.getElementById('toggle-rail').setAttribute('aria-expanded', String(spec.ui.rail));
     viewport.panMode = spec.presentation.pan; document.getElementById('pan-behavior').value = viewport.panMode;
     if (spec.ui.detailWidth === null) document.body.style.removeProperty('--detail-preferred');
     else document.body.style.setProperty('--detail-preferred', `${spec.ui.detailWidth * window.innerWidth}px`);
@@ -193,17 +246,27 @@ async function restoreView(spec) {
     } else { state.unresolvedFocus = spec.ui.focus; warnings.push('Focused item is unavailable'); } }
     state.layoutAspect = spec.flat.view.fitted ? null : spec.flat.aspect;
     state.filtered = filterScope(state.clips, state);
-    state.flatDirty = state.spatialDirty = true;
+    state.flatDirty = state.spatialDirty = state.aisleDirty = state.floatDirty = true;
     clearTrayReturn();
     state.clusters = contextClusters(state.clips, state.filtered, state.facetLabels, state.active);
-    renderScope(); renderContext();
+    renderScope(); renderContext(); buildFacetRail();
     await frames(); render();
     if (spec.spatial) {
       await toggleSpatial(true);
       if (!state.spatial?.built) throw new Error('Spatial renderer could not be loaded');
-      state.spatial.restoreView(spec.spatial);
+      // A live intent seeds a fitted camera, not a saved pile arrangement.
+      // Keep the canonical grouped presentation when no saved arrangement exists.
+      if(!(intent&&spec.spatial.fitted&&spec.spatial.mode==='mountain'&&!spec.spatial.arrangement.piles.length&&piled(state.groupKey)))state.spatial.restoreView(spec.spatial);
     }
-    if (state.spatialOn !== (spec.presentation.mode === '3d')) await toggleSpatial(spec.presentation.mode === '3d');
+    if(spec.presentation.mode==='aisle'){
+      await toggleSpatial(true,'aisle');
+      if(!state.aisle?.built)throw new Error('Aisle renderer could not be loaded');
+      state.aisle.restoreView(spec.aisle);
+    }else if(spec.presentation.mode==='float'){
+      await toggleSpatial(true,'float');
+      if(!state.float?.built)throw new Error('Floating space could not be loaded');
+      state.float.restoreView(spec.float);state.floatSnapshot=null;
+    }else await toggleSpatial(spec.presentation.mode==='3d');
     await frames();
     if (spec.flat.view.fitted) viewport.fit();
     else {
@@ -223,15 +286,34 @@ async function restoreView(spec) {
 async function boot() {
   let data;
   try {
-    const res = await fetch('data/clips.json');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    data = await res.json();
+    if (collection) {
+      const loaded = await loadCollection(collection);
+      data = loaded.data;
+      state.viewState = new ViewStateStore(collectionViewState(loaded.viewState));
+      for (const warning of loaded.warnings) console.warn(`[wunderkammer] collection: ${warning}`);
+    } else {
+      const res = await fetch('/api/clips');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      data = await res.json();
+    }
+    perf.mark('boot/data');
   } catch (err) {
-    showEmpty('Could not reach the clipwall server.', String(err.message || err));
+    showEmpty(collection ? 'Could not load the collection.' : 'Could not reach the wunderkammer server.', String(err.message || err));
+    // Details go only to a parent that supplied the document itself. A URL is
+    // fetched with this page's origin, so its problems can quote content the
+    // embedder could not read; the frame still shows them to the person.
+    notifyEmbedder({ type: 'wunderkammer:error', message: collection === FROM_PARENT
+      ? String(err.message || err) : 'The collection could not be loaded; the wall shows why.' });
     return;
   }
 
   state.clips = Array.isArray(data.clips) ? data.clips : [];
+  // Baked overview pages (scripts/sheets.py): the overview paints the whole
+  // wall from a few of them instead of decoding every cover file. A
+  // collection's own sheets (scripts/collection-sheets.py) also serve every
+  // other tier for clips that have no cover file.
+  spriteCovers.setCorpus(data.sheets, state.clips, { covers: data.images?.sheets === 'covers' });
+  overview.setSheets(data.sheets, state.clips);
   // Production supplies a server-computed SHA revision. Legacy adapters and
   // fixture origins must still render when Web Crypto is unavailable.
   let revision = 'unversioned';
@@ -240,22 +322,29 @@ async function boot() {
   state.corpus = data.corpus || { id: `legacy:${location.origin}:${data.ui?.title || ''}`, revision };
   state.facets = data.facets || {};
   state.facetLabels = data.ui?.facetLabels || {};
+  state.nouns = collectionNouns({ clips: state.clips, ui: data.ui });
   if (typeof data.ui?.title === 'string') {
     document.title = data.ui.title;
     document.querySelector('.brand').textContent = data.ui.title;
   }
   if (Array.isArray(data.ui?.facetOrder)) facetOrder = data.ui.facetOrder.filter(k => typeof k === 'string');
-  buildFacetRail();
+  // Instance-specific fields can remain in clip data without appearing as browsing controls.
+  if (Array.isArray(data.ui?.hiddenFacets)) {
+    for (const key of data.ui.hiddenFacets) if (typeof key === 'string') FACET_BLOCKLIST.add(key);
+  }
   buildGroupOptions();
   buildReviewControls();
   if ([...el.group.options].some(opt => opt.value === data.ui?.defaultGroup)) {
     state.groupKey = data.ui.defaultGroup;
     el.group.value = state.groupKey;
   }
+  state.defaultGroup = state.groupKey;
   applyFilters();
   await frames();
   await links.start();
   document.body.dataset.viewReady = 'true';
+  notifyEmbedder({ type: 'wunderkammer:view-ready' });
+  perf.mark('boot/ready');
 }
 
 function scopeLabel() {
@@ -264,6 +353,29 @@ function scopeLabel() {
   if (state.query.trim()) parts.unshift(`Search: ${state.query.trim()}`);
   if (state.branches) parts.unshift(state.branches.map(b => b.label).join(' OR '));
   return parts.join(' · ') || 'All content';
+}
+/**
+ * What this view shows, for an agent reading the page or a person handing it to
+ * a conversation: scope, focus, the pinned highlight and the exact in-scope
+ * items as identities and titles, in corpus order. Never notes or paths.
+ */
+function exportView() {
+  const entry = clip => ({ key: clipKey(clip), title: String(clip.title || clipKey(clip)) });
+  const focus = state.clips.find(c => c.id === state.selected) || null;
+  const key = brush.getPinned(), value = brush.getPinnedValue();
+  const highlighted = key && value !== null ? state.filtered.filter(clip => matchesFacet(clip, key, new Set([String(value)]))) : null;
+  return {
+    format: 'wunderkammer.export', version: 1,
+    corpus: state.corpus ? { ...state.corpus } : null,
+    scope: { label: scopeLabel(), query: state.query.trim(),
+      facets: Object.fromEntries([...state.active].filter(([, v]) => v.size).map(([k, v]) => [k, [...v].sort()])),
+      branches: state.branches ? state.branches.map(b => ({ label: b.label, count: b.keys.length })) : null },
+    view: { mode: state.mode, group: state.groupKey },
+    focus: focus ? entry(focus) : null,
+    highlight: highlighted ? { key, value: String(value), count: highlighted.length, keys: highlighted.map(clipKey) } : null,
+    count: state.filtered.length, total: state.clips.length,
+    evidence: state.filtered.map(entry),
+  };
 }
 function scopeSnapshot() {
   return { query: state.query, active: new Map([...state.active].map(([k, v]) => [k, new Set(v)])),
@@ -284,21 +396,22 @@ function selectCluster(cluster, add) {
     ? [...state.branches, { label: cluster.label, keys: [...cluster.keys] }]
     : chooseCluster(state.filtered, cluster, add, scopeLabel());
   state.query = ''; state.active.clear(); el.search.value = '';
-  closeDetail(); buildFacetRail(); applyFilters();
+  closeDetail(); applyFilters();
   document.getElementById('scope-back').focus();
 }
 let filterFrame = 0;
-function applyFilters({ restore = null } = {}) {
+function applyFilters(opts) { return perf.span('filter', () => applyFiltersNow(opts)); }
+function applyFiltersNow({ restore = null } = {}) {
   if (!restore) state.layoutAspect = null;
   cancelAnimationFrame(filterFrame);
   if (!state.query.trim()) state.contextBase = null; // no search, no pre-search place
   setBackgroundRevealed(false);
-  state.filtered = filterScope(state.clips, state);
-  state.clusters = contextClusters(state.clips, state.filtered, state.facetLabels, state.active);
-  renderScope(); renderContext();
+  state.filtered = perf.span('filter/scope', () => filterScope(state.clips, state));
+  state.clusters = perf.span('filter/clusters', () => contextClusters(state.clips, state.filtered, state.facetLabels, state.active));
+  perf.span('filter/scope-ui', () => { renderScope(); renderContext(); buildFacetRail(); });
   invalidatePreview(); clearTrayReturn();
   if (state.selected && !state.filtered.some(c => c.id === state.selected)) closeDetail();
-  state.flatDirty = state.spatialDirty = true;
+  state.flatDirty = state.spatialDirty = state.aisleDirty = state.floatDirty = true;
   // Scope is authoritative now; a hidden presentation materializes on entry.
   if (state.spatialOn) { refreshSpatial(); updateReviewOrder(); renderCount(); }
   else render();
@@ -306,6 +419,7 @@ function applyFilters({ restore = null } = {}) {
     if (!state.spatialOn) { if (restore) viewport.restore(restore); else viewport.fit(); }
   });
 }
+let scopeSummarySignature = null;
 function renderScope() {
   const host = document.getElementById('scope-bar');
   const scoped = !!state.branches || !!state.query.trim() || [...state.active.values()].some(v => v.size);
@@ -316,6 +430,13 @@ function renderScope() {
   document.body.classList.toggle('has-scope', !host.hidden);
   document.getElementById('scope-back').disabled = links?.ready ? !links.canBack : !state.scopeHistory.length;
   const summary = document.getElementById('scope-summary');
+  // History updates also follow camera/detail changes. Keep surviving controls
+  // (and keyboard focus) intact when their displayed scope has not changed.
+  const signature = JSON.stringify([state.query.trim(), state.branches?.map(b => b.label) ?? null,
+    [...state.active].filter(([, values]) => values.size).map(([key, values]) =>
+      [key, state.facetLabels[key] || key, [...values]])]);
+  if (signature === scopeSummarySignature) return;
+  scopeSummarySignature = signature;
   summary.replaceChildren();
   if (state.branches) for (const [index, branch] of state.branches.entries()) {
     if (index) summary.append(document.createTextNode(' OR '));
@@ -328,60 +449,37 @@ function renderScope() {
     });
     summary.append(button);
   }
-  const text = document.createElement('span');
-  text.textContent = state.branches ? (state.branches.length ? ' · Search and facets refine this union' : 'Empty scope') : scopeLabel();
-  summary.append(text);
-  // Keep rail truth in sync after history and scope replacement.
-  for (const chip of el.rail.querySelectorAll('[data-facet]'))
-    chip.setAttribute('aria-pressed', String(state.active.get(chip.dataset.facet)?.has(chip.dataset.value) || false));
-  updateFacetShares(scoped);
-}
-
-/**
- * A chip's number counts the whole collection, not the view — so once a scope
- * narrows things, every number in the rail is describing a collection you are
- * no longer looking at. Fill each chip left-to-right by the fraction of ITS
- * OWN count that survives the current scope: a full chip is untouched by the
- * filter, a tenth-full chip has ten percent of itself left, an empty one has
- * nothing here at all.
- *
- * Unscoped, every fraction is 1 by definition and a wall of full chips would
- * say nothing, so the fill is not drawn at all until there is a scope.
- *
- * The fill is decoration; the number it encodes goes in aria-label, because a
- * proportion nobody can read is not a label.
- */
-function updateFacetShares(scoped) {
-  const chips = [...el.rail.querySelectorAll('[data-facet]')];
-  if (!chips.length) return;
-  if (!scoped) {
-    for (const chip of chips) { delete chip.dataset.share; chip.style.removeProperty('--share'); setChipLabel(chip, null); }
-    return;
+  if (state.branches?.length === 0) summary.append(document.createTextNode('Empty scope'));
+  if (state.query.trim()) {
+    const query = document.createElement('button'); query.type = 'button'; query.className = 'btn scope-query';
+    query.textContent = `Search: ${state.query.trim()} ×`;
+    query.setAttribute('aria-label', `Remove search: ${state.query.trim()}`);
+    query.addEventListener('click', () => {
+      rememberScope(); state.query = ''; el.search.value = ''; applyFilters();
+      document.getElementById('scope-back').focus({ preventScroll: true });
+    });
+    summary.append(query);
   }
-  // One pass over the in-view clips per facet key present in the rail.
-  const keys = [...new Set(chips.map(c => c.dataset.facet))];
-  const counts = new Map(keys.map(k => [k, new Map()]));
-  for (const clip of state.filtered)
-    for (const key of keys) {
-      const bucket = counts.get(key);
-      for (const value of valuesOf(clip, key)) bucket.set(value, (bucket.get(value) || 0) + 1);
+  for (const [key, values] of state.active) {
+    if (!values.size) continue;
+    const group = document.createElement('span'); group.className = 'scope-facet';
+    group.setAttribute('role', 'group'); group.setAttribute('aria-label', `${state.facetLabels[key] || key}: any selected value`);
+    const label = document.createElement('span'); label.textContent = `${state.facetLabels[key] || key}: `;
+    group.append(label);
+    for (const [index, value] of [...values].entries()) {
+      if (index) group.append(document.createTextNode(' or '));
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn scope-value';
+      remove.dataset.scopeFacet = key; remove.dataset.scopeValue = value;
+      remove.textContent = `${value} ×`; remove.setAttribute('aria-label', `Remove ${state.facetLabels[key] || key}: ${value}`);
+      remove.addEventListener('click', () => removeFacetValue(key, value));
+      group.append(remove);
     }
-  for (const chip of chips) {
-    const total = Number(chip.dataset.total) || 0;
-    const inView = counts.get(chip.dataset.facet)?.get(chip.dataset.value) || 0;
-    const share = total > 0 ? Math.min(1, inView / total) : 0;
-    chip.dataset.share = share === 0 ? 'none' : share >= 0.999 ? 'all' : 'part';
-    chip.style.setProperty('--share', String(share));
-    setChipLabel(chip, inView);
+    if (summary.childNodes.length) summary.append(document.createTextNode(' · '));
+    summary.append(group);
   }
+  if (!summary.childNodes.length) summary.textContent = 'All content';
 }
 
-/** Say the proportion in words; the gradient only draws it. */
-function setChipLabel(chip, inView) {
-  const total = chip.dataset.total, value = chip.dataset.value;
-  if (inView === null) chip.setAttribute('aria-label', `${value}, ${total} in the collection`);
-  else chip.setAttribute('aria-label', `${value}, ${inView} of ${total} in view`);
-}
 function renderContext() {
   const host = document.getElementById('context-clusters');
   host.hidden = true; // Cluster suggestions keep their mechanics; their placement is undecided.
@@ -399,8 +497,11 @@ function renderContext() {
     const samples = Array.from({ length: Math.min(6, cluster.members.length) }, (_, i) =>
       cluster.members[Math.floor(i * cluster.members.length / Math.min(6, cluster.members.length))]);
     for (const clip of samples) {
-      const src = clip.cover || clip.media?.[0]?.src;
-      if (src) { const img = document.createElement('img'); img.src = src; img.alt = ''; img.draggable = false; montage.append(img); }
+      const sprite = spriteCovers.has(clip), src = clip.cover || clip.media?.[0]?.src;
+      if (src || sprite) {
+        const img = document.createElement('img'); img.alt = ''; img.draggable = false; montage.append(img);
+        if (sprite) void spriteCovers.coverUrl(clip, devicePx(96), src).then(url => { if (url) img.src = url; }); else img.src = src;
+      }
       else { const fallback = document.createElement('span'); fallback.textContent = clip.title || 'No image'; montage.append(fallback); }
     }
     button.append(title, montage, reason);
@@ -445,7 +546,7 @@ function renderBackground(foreground, stageRect = null) {
   const key = backgroundKey();
   if (state.background.key !== key || !state.background.full) {
     state.background.key = key;
-    state.background.full = layout(sortClips(base, state.sort), state.groupKey, { viewportAspect: state.renderAspect });
+    state.background.full = layout(sortClips(base, state.sort), state.groupKey, { viewportAspect: state.renderAspect, universe: state.clips });
   }
   state.background.framed = frameAround(state.background.full, { w: foreground.width, h: foreground.height });
   state.background.foreground = { w: foreground.width, h: foreground.height };
@@ -572,11 +673,11 @@ document.getElementById('scope-back').addEventListener('click', () => {
   const previous = state.scopeHistory.pop(); if (!previous) return;
   Object.assign(state, { query: previous.query, active: previous.active, branches: previous.branches, groupKey: previous.groupKey });
   el.search.value = state.query; el.group.value = state.groupKey;
-  closeDetail(); buildFacetRail(); applyFilters({ restore: previous.view });
+  closeDetail(); applyFilters({ restore: previous.view });
 });
 document.getElementById('scope-clear').addEventListener('click', () => {
   rememberScope(); state.query = ''; state.active.clear(); state.branches = null;
-  el.search.value = ''; closeDetail(); buildFacetRail(); applyFilters();
+  el.search.value = ''; closeDetail(); applyFilters();
 });
 
 /* ------------------------------------------------------------- spatial --- */
@@ -587,82 +688,125 @@ document.getElementById('scope-clear').addEventListener('click', () => {
  * it should pay for, and all of which would make the flat wall's first paint
  * slower for no reason.
  */
-async function toggleSpatial(on) {
+function activeSpatial() { return state.mode==='aisle'?state.aisle:state.mode==='float'?state.float:state.spatial; }
+/** Sort and the attribute lens arrange or recolour the evidence; the 3D piles and the floating space place it by other rules. */
+const lensless = mode => mode==='3d' || mode==='float';
+async function toggleSpatial(on, kind='3d') {
   if (state.spatialLoading) return;
-  if (on && !state.spatial) {
+  const next=on?kind:'flat';
+  if (on && !(kind==='aisle'?state.aisle:kind==='float'?state.float:state.spatial)) {
     state.spatialLoading = true;
     try {
-      // Module-relative: the static demo is served from a sub-path, where /wall/… would 404.
-      const { SpatialView, keyOfClip } = await import('./spatial/spatial-view.mjs');
-      state.clipKey = keyOfClip;
-      state.spatial = new SpatialView(el.spHost, {
-        onOpen: openDetail,
-        // Same preview the flat wall uses. The view guards touch and drag and
-        // coalesces to one pick per frame; hoverEnabled keeps it from picking
-        // at all until there is a selection for a preview to override.
-        onHover: (clip, event) => hoverPreview(clip, event),
-        onInteraction: invalidatePreview,
-        onHoverEnd: hoverEnd,
-        hoverEnabled: () => !!state.selected,
-      });
-      await loadViewState();
-    } catch (err) {
-      // three.js comes from a CDN; offline, this is the failure. Say so rather
-      // than leaving a blank panel and a working-looking button.
-      showEmpty('Could not start the spatial view.', String(err.message || err));
-      el.empty.classList.remove('hidden');
+      const hooks={onOpen:openDetail,onHover:(clip,event)=>hoverPreview(clip,event),onInteraction:invalidatePreview,onHoverEnd:hoverEnd,hoverEnabled:()=>!!state.selected};
+      if(kind==='aisle'){
+        const {AisleView}=await import('./aisle-view.mjs');
+        state.aisle=new AisleView(el.aisleHost,hooks);
+      }else if(kind==='float'){
+        const {FloatView}=await import('./float-view.mjs');
+        // The detail pane overlays the stage's right edge; fly-to lands beside it.
+        state.float=new FloatView(el.floatHost,{...hooks,axisKeys:attributeKeys,labelFor:key=>state.facetLabels[key]||key,obscuredRight:()=>el.detail.classList.contains('open')&&window.innerWidth>800?el.detail.getBoundingClientRect().width:0});
+      }else{
+        const {SpatialView,keyOfClip}=await import('./spatial/spatial-view.mjs');
+        state.clipKey=keyOfClip;state.spatial=new SpatialView(el.spHost,hooks);
+        await loadViewState();
+      }
+    } catch(err) {
+      linkNotice(`Could not start ${kind==='aisle'?'the aisle':kind==='float'?'the floating space':'the spatial view'}: ${err.message}. The current view remains available.`);
       return;
-    } finally {
-      state.spatialLoading = false;
-    }
+    } finally { state.spatialLoading=false; }
   }
-  viewport.resetEdge();
-  viewport.enabled = !on;
-  document.getElementById('edge-feedback').hidden = on;
-  document.getElementById('pan-behavior').disabled = on;
-  state.spatialOn = on;
-  // Switching representation drops any hover in flight: the pointer is over a
-  // surface that is about to stop existing, and no leave event is coming.
-  endPreview();
-  state.spatial?._endHover?.();
-  brush.setEnabled(!on);
-  for (const id of ['sort-key', 'sort-direction', 'attribute-lens']) document.getElementById(id).disabled = on;
-  updateSortDirection();
-  renderContext();
-  if (on) setBackgroundRevealed(false);
-  el.spHost.hidden = !on;
-  el.canvas.style.visibility = on ? 'hidden' : '';
-  el.view3d.setAttribute('aria-pressed', String(on));
-  el.view3d.classList.toggle('on', on);
-  if (!on) {
-    if (state.flatDirty) { render(); viewport.fit(); }
-    updateBackgroundVisibility();
-  }
+  viewport.resetEdge();viewport.enabled=!on;
+  document.getElementById('edge-feedback').hidden=on;
+  document.getElementById('pan-behavior').disabled=on;
+  state.mode=next;document.body.dataset.viewMode=next;
+  endPreview();state.spatial?._endHover?.();state.aisle?.cancelHover();state.float?.cancelHover();
+  brush.setEnabled(!lensless(next));
+  for(const id of ['sort-key','sort-direction','attribute-lens'])document.getElementById(id).disabled=lensless(next);
+  updateSortDirection();syncLensValue();renderContext();
+  if(on)setBackgroundRevealed(false);
+  el.spHost.hidden=next!=='3d';el.aisleHost.hidden=next!=='aisle';el.floatHost.hidden=next!=='float';
+  state.aisle?.setVisible(next==='aisle');state.float?.setVisible(next==='float');
+  el.canvas.style.visibility=on?'hidden':'';
+  for(const [button,mode] of [[el.view3d,'3d'],[el.viewAisle,'aisle'],[el.viewFloat,'float']]){button.setAttribute('aria-pressed',String(next===mode));button.classList.toggle('on',next===mode);}
+  if(!on){if(state.flatDirty){render();viewport.fit();}updateBackgroundVisibility();}
   syncOverview();
-  if (on) {
-    if (state.spatialDirty || !state.spatial.built) refreshSpatial();
-    document.getElementById('sp-css3d')?.focus();
+  if(on){
+    const refresh=(next==='aisle'?state.aisleDirty:next==='float'?state.floatDirty:state.spatialDirty)||!activeSpatial()?.built;
+    if(refresh)refreshSpatial();
+    if(next==='float'){
+      if(state.floatSnapshot){state.float.restoreView(state.floatSnapshot);state.floatSnapshot=null;}
+      el.floatHost.querySelector('canvas')?.focus({preventScroll:true});
+    }else if(next==='aisle'){
+      if(state.aisleSnapshot){state.aisle.restoreView(state.aisleSnapshot);state.aisleSnapshot=null;}
+      el.aisleHost.querySelector('canvas')?.focus({preventScroll:true});
+    }else if(refresh)document.getElementById('sp-css3d')?.focus();
   }
-  // Flat navigation belongs to its presentation. Keep its return pose across
-  // a renderer switch, but never leave invisible-wall controls over the field.
   updateRowTitle(el.stage.getBoundingClientRect());
-  trayReturnButton.hidden = trayFilterButton.hidden = on || !state.trayReturn;
+  trayReturnButton.hidden=trayFilterButton.hidden=on||!state.trayReturn;
 }
 
+/** Facet groupings become 3D piles; no grouping and the similarity arrangements are one field. */
+const piled = key => !!key && key !== 'none' && !isSimilarity(key);
+
+/*
+ * Arrangement icons (after PixPlot's layout icons): grouped wall, similarity
+ * grid, similarity map. They drive the same #group select, so permalinks,
+ * view state and the 3D field see one value. The wall icon returns to the
+ * last facet grouping (or the instance default).
+ */
+const arrangeEl = document.getElementById('arrange');
+let lastWallGroup = null;
+function syncArrangement() {
+  if (!arrangeEl) return;
+  const has = key => [...el.group.options].some(o => o.value === key);
+  arrangeEl.hidden = !has(SIMILARITY) && !has(SIMILARITY_GRID);
+  if (!isSimilarity(state.groupKey)) lastWallGroup = state.groupKey;
+  const current = state.groupKey === SIMILARITY ? 'map' : state.groupKey === SIMILARITY_GRID ? 'grid' : 'wall';
+  for (const b of arrangeEl.querySelectorAll('button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.arrange === current));
+    if (b.dataset.arrange !== 'wall') b.hidden = !has(b.dataset.arrange === 'map' ? SIMILARITY : SIMILARITY_GRID);
+  }
+}
+arrangeEl?.addEventListener('click', e => {
+  const b = e.target.closest('button[data-arrange]');
+  if (!b) return;
+  const want = b.dataset.arrange === 'map' ? SIMILARITY : b.dataset.arrange === 'grid' ? SIMILARITY_GRID
+    : lastWallGroup ?? state.defaultGroup ?? 'none';
+  if (want === el.group.value) return;
+  el.group.value = want;
+  el.group.dispatchEvent(new Event('change'));
+});
+
 function refreshSpatial() {
-  state.spatialDirty = false;
+  if(state.mode==='float'){
+    // The whole corpus floats; scope only dims, so positions keep their meaning.
+    state.floatDirty=false;
+    state.float.setClips(state.clips,state.filtered,{nouns:state.nouns});
+    state.float.setFocused?.(state.clips.find(c=>c.id===state.selected)?clipKey(state.clips.find(c=>c.id===state.selected)):null);
+    renderScopeEmpty();syncArrangement();return;
+  }
+  if(state.mode==='aisle'){
+    state.aisleDirty=false;
+    state.aisle.setClips(state.filtered,state.groupKey,{sort:state.sort,labelFor:key=>state.facetLabels[key]||key,nouns:state.nouns});
+    brush.refresh();state.aisle.setLens(brush.getActive());syncLensValue();
+    state.aisle.setFocused?.(state.clips.find(c=>c.id===state.selected)?clipKey(state.clips.find(c=>c.id===state.selected)):null);
+    renderScopeEmpty();syncArrangement();return;
+  }
+  state.spatialDirty=false;
   // The scene and current clip map must exist BEFORE restoring URL-keyed piles.
   // The corpus and its revision: the field is built once per corpus and a
   // filter is membership, so narrowing and widening never reload a tile.
   state.spatial.setClips(state.filtered, state.groupKey, { corpus: state.clips, revision: state.corpus?.revision ?? 'unversioned' });
   const doc = state.arrangementOverride || state.viewState.doc;
   if (doc?.piles?.length && doc.mode !== 'mountain') state.spatial.restore(doc);
-  else if (state.groupKey !== 'none') state.spatial.showPiles(state.groupKey);
+  else if (piled(state.groupKey)) state.spatial.showPiles(state.groupKey);
+  renderScopeEmpty();
+  syncArrangement();
 }
 
 function viewStateError(message, err) {
   state.viewStateError = message;
-  console.warn(`[clipwall] ${message}:`, err.message);
+  console.warn(`[wunderkammer] ${message}:`, err.message);
   renderCount();
 }
 
@@ -677,7 +821,7 @@ async function loadViewState() {
     const known = new Set(state.clips.map(state.clipKey));
     const orphaned = (doc.piles || []).flatMap((p) => p.keys).filter((key) => !known.has(key));
     if (orphaned.length) {
-      console.warn(`[clipwall] view state: ${orphaned.length} keys no longer resolve; retained in saved state`, orphaned.slice(0, 8));
+      console.warn(`[wunderkammer] view state: ${orphaned.length} keys no longer resolve; retained in saved state`, orphaned.slice(0, 8));
     }
   } catch (err) {
     viewStateError('Saved piles not loaded — reload to retry', err);
@@ -685,7 +829,7 @@ async function loadViewState() {
 }
 
 async function saveViewState() {
-  if (!state.spatial || hydrating) return;
+  if (!state.spatial || hydrating || state.mode==='aisle' || state.mode==='float') return;
   try {
     const doc = mergePileState({
       ...state.spatial.serialize(),
@@ -709,21 +853,30 @@ function updateReviewOrder() {
     if (seen.has(clip.id)) return false; seen.add(clip.id); return true;
   });
 }
-function render() {
+// The stage size the last render() laid out for. The stage ResizeObserver
+// compares against it: when the scope bar appears, applyFilters has already
+// rendered at the new size (renderScope runs first), so a refit would be a
+// second identical render for one click.
+let renderedStage = null;
+function render() { perf.span('render', renderNow); }
+function renderNow() {
   state.flatDirty = false;
   state.layoutEpoch = (state.layoutEpoch || 0) + 1;
   invalidatePreview();
   imageWork.clear();
-  const previous = captureLayoutMotion(state.positions);
+  const previous = perf.span('render/capture-motion', () => captureLayoutMotion(state.positions));
   // One measurement, read before any write and threaded through everything
   // below. Each further getBoundingClientRect() after a style write forced a
   // synchronous layout of the whole wall; a filter change paid that four times.
-  const bounds = el.stage.getBoundingClientRect();
+  const bounds = perf.span('render/measure', () => el.stage.getBoundingClientRect());
+  renderedStage = { w: bounds.width, h: bounds.height };
+  stageSize = { width: bounds.width, height: bounds.height };
   const pad = viewport.fitPadding(bounds);
   state.renderAspect = state.layoutAspect || Math.max(1, bounds.width - pad * 2) / Math.max(1, bounds.height - pad * 2);
-  const result = layout(sortClips(state.filtered, state.sort), state.groupKey, {
-    viewportAspect: state.renderAspect
-  });
+  const result = perf.span('render/layout', () => layout(sortClips(state.filtered, state.sort), state.groupKey, {
+    // The similarity map places the corpus once; a filter hides, never re-projects.
+    viewportAspect: state.renderAspect, universe: state.clips
+  }));
 
   viewport.setContent(result.width, result.height, result.tiles);
   el.canvas.style.width = `${result.width}px`;
@@ -733,21 +886,33 @@ function render() {
   if (tour.on) setTour(false); // a new layout ends the flythrough; the user is steering
   // Review order for Dive traversal: the laid-out order, one entry per clip.
   { const seen = new Set(); state.order = []; for (const t of result.tiles) if (!seen.has(t.clip.id)) { seen.add(t.clip.id); state.order.push(t.clip); } }
-  renderBlocks(result.blocks);
-  renderTiles(result.tiles);
-  const motionCount = animateLayout(previous, state.positions, state.tileEls, viewport.visiblePose(), bounds);
+  perf.span('render/blocks', () => renderBlocks(result.blocks));
+  perf.span('render/tiles', () => renderTiles(result.tiles));
+  const motionCount = perf.span('render/motion', () => animateLayout(previous, state.positions, state.tileEls, viewport.visiblePose(), bounds));
   layoutMotionUntil = motionCount ? performance.now() + 240 : 0;
-  overview.setEnabled(false);
-  overview.setTiles([...state.positions].map(([key, t]) => ({ ...t, key, node: state.tileEls.get(key) })));
-  if (motionCount) setTimeout(syncOverview, 250); else syncOverview();
+  // The overview stays on through a layout change. Only the (at most 64)
+  // travelling cards fall back to their DOM images until they land: switching
+  // the whole overview off showed every hidden <img> at once, a ~500 ms cold
+  // GPU upload on the Music Atlas (docs/PERF.md, finding 1).
+  perf.span('render/overview-tiles', () => overview.setTiles([...state.positions].map(([key, t]) => ({ ...t, key, node: state.tileEls.get(key) }))));
+  overview.setDomOnly(motionCount ? movingNodes() : null);
+  const motionToken = ++layoutMotionToken;
+  if (motionCount) setTimeout(() => { if (motionToken === layoutMotionToken) overview.setDomOnly(null); }, 250);
+  syncOverview();
   // A new layout means new slots: showcase cards restart from the fresh geometry.
   if (showcase.on) { for (const card of showcase.cards.values()) card.remove(); showcase.cards.clear(); }
-  renderBackground(result, bounds);
-  brush.refresh();
+  perf.span('render/background', () => renderBackground(result, bounds));
+  perf.span('render/brush', () => {brush.refresh();syncLensValue();});
   applyScaleStyles(viewport.scale, { force: true });
 
   renderCount();
+  renderScopeEmpty();
+  perf.span('render/visibility', () => updateVisibility({ rect: bounds }));
+  syncArrangement();
+}
 
+/** Scope recovery belongs to both presentations, independently of tile layout. */
+function renderScopeEmpty() {
   const nothing = state.filtered.length === 0;
   el.empty.classList.toggle('hidden', !nothing);
   if (nothing) {
@@ -755,15 +920,23 @@ function render() {
       state.clips.length ? 'No clips match these filters.' : 'The vault is empty.',
       state.clips.length ? 'Clear the filters, or widen the search.' : null
     );
+    if (state.clips.length) {
+      const recover = document.createElement('button'); recover.type = 'button'; recover.className = 'btn';
+      recover.textContent = 'Show all content';
+      recover.addEventListener('click', () => {
+        document.getElementById('scope-clear').click();
+        document.getElementById('scope-back').focus({ preventScroll: true });
+      });
+      el.empty.append(recover);
+    }
   }
-  updateVisibility({ rect: bounds });
 }
 
 function renderCount() {
   el.count.replaceChildren();
   const strong = document.createElement('b');
   strong.textContent = String(state.filtered.length);
-  el.count.append(strong, document.createTextNode(` of ${state.clips.length} clips`));
+  el.count.append(strong, document.createTextNode(` of ${counted(state.clips.length, state.nouns)}`));
   if (state.viewStateError) el.count.append(document.createTextNode(` · ${state.viewStateError}`));
 }
 
@@ -807,7 +980,7 @@ function buildBlock(b, { background = false } = {}) {
   // Foreground headings approach a tray; context headings explicitly pivot scope.
   if (b.label && b.label !== '—') {
     h2.tabIndex = 0; h2.setAttribute('role', 'button');
-    h2.setAttribute('aria-label', `${b.label}: ${background ? 'filter to' : 'approach'} this group, ${b.count} items`);
+    h2.setAttribute('aria-label', `${b.label}: ${background ? 'filter to' : 'approach'} this group, ${counted(b.count, state.nouns)}`);
     h2.addEventListener('click', e => { if ((viewport.lastDragDistance || 0) > 4) return; if (background || e.shiftKey) selectGroup(b.label, e.shiftKey); else approachGroup(b); });
     h2.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (background || e.shiftKey) selectGroup(b.label, e.shiftKey); else approachGroup(b); } });
   }
@@ -866,20 +1039,39 @@ function buildTile(clip, { background = false } = {}) {
   node.setAttribute('role', 'button');
   node.setAttribute('aria-label', clip.title || 'clip');
 
+  // A cover served by sprite-sheet cells gets its <img> source at reveal time,
+  // cropped at the size the tile is drawn (revealSprite). Its file, if it has
+  // one, waits in data-file(-srcset), not data-src: the overview's handoff
+  // starts every data-src it finds, and the file is only for a cell whose
+  // page fails to load (revealTiles moves it over then).
+  const sprite = spriteCovers.has(clip);
   const src = clip.cover || clip.media?.[0]?.src || '';
-  if (src) {
+  if (src || sprite) {
     const img = document.createElement('img');
     img.alt = '';                    // decorative; the caption carries the name
-    img.dataset.src = src;
-    if (Array.isArray(clip.coverVariants) && clip.coverVariants.length) {
-      img.dataset.srcset = clip.coverVariants.filter(v => typeof v.src === 'string' && Number.isFinite(v.width) && v.width > 0)
-        .map(v => `${v.src} ${Math.round(v.width)}w`).join(', ');
+    const srcset = Array.isArray(clip.coverVariants) && clip.coverVariants.length
+      ? clip.coverVariants.filter(v => typeof v.src === 'string' && Number.isFinite(v.width) && v.width > 0)
+        .map(v => `${v.src} ${Math.round(v.width)}w`).join(', ') : '';
+    if (sprite) {
+      img.dataset.sprite = '0';
+      if (src) img.dataset.file = src;
+      if (srcset) img.dataset.fileSrcset = srcset;
+    } else {
+      if (src) img.dataset.src = src;
+      if (srcset) img.dataset.srcset = srcset;
     }
     img.draggable = false; // native image dragging cancels the canvas pointer gesture
     img.decoding = 'async';
     // A dead attachment must not leave an invisible hole in the wall.
     img.addEventListener('error', () => node.classList.add('broken'), { once: true });
     node.append(img);
+    // Until the image decodes, the cell shows the image's dominant colour, so
+    // a section reads as a colour field at once instead of a grid of empty
+    // slots that fills in over seconds. Palettes are sorted by share, so [0]
+    // is the dominant one. Only where there is an image: a no-media tile puts
+    // its title text on the tile ground, and that must stay the dark panel.
+    const tint = Array.isArray(clip.palette) ? clip.palette[0] : null;
+    if (typeof tint === 'string' && /^#[0-9a-f]{6}$/i.test(tint)) node.style.setProperty('--tile-tint', tint);
   } else {
     node.classList.add('no-media');
     const fb = document.createElement('div');
@@ -918,6 +1110,8 @@ function buildTile(clip, { background = false } = {}) {
 /* ------------------------------------------------- visibility & zoom  --- */
 
 let labelScaleApplied = 0, scaleStyleTimer = 0;
+/** The caption tier the camera last landed in: 'far' hides captions, 'near' adds the metadata line. */
+let captionTier = 'mid';
 /**
  * Everything whose CSS depends on the camera scale: label sizes, the caption
  * zoom tiers, tight-block headings and the context plane's internal scale.
@@ -938,6 +1132,7 @@ function applyScaleStyles(s = viewport.scale, { force = false } = {}) {
   // on every frame. Re-apply them only once the zoom has drifted ~8% from the
   // last applied value.
   if (force || !labelScaleApplied || Math.abs(Math.log(s / labelScaleApplied)) > 0.08) {
+    const done = perf.begin('scale-styles');
     labelScaleApplied = s;
     // A stage-level inherited variable restyled every descendant. Headings
     // belong to the small group set; captions upgrade only in visible tiles.
@@ -955,12 +1150,36 @@ function applyScaleStyles(s = viewport.scale, { force = false } = {}) {
       else planeLabelSizes(s);
     }
     updateTightBlocks(s);
+    done();
   }
-  el.canvas.classList.toggle('z-far', s < (el.canvas.classList.contains('z-far') ? 0.36 : 0.30));
-  el.canvas.classList.toggle('z-near', s > (el.canvas.classList.contains('z-near') ? 1.10 : 1.20));
+  const tier = captionTierFor(s);
+  if (tier === captionTier) return;
+  captionTier = tier;
+  // A canvas-level class here restyled all 1,800 tiles in one 55 ms frame
+  // (audit 2026-10-13, finding 5). Restyle only the tiles on screen now;
+  // revealTiles gives every other tile the tier as it comes into view.
+  const done = perf.begin('scale-tier');
+  for (const [id, node] of state.tileEls) if (state.positions.get(id)?.shown) applyCaptionTier(node);
+  done();
 }
-function onViewportChange(v, stageRect = el.stage.getBoundingClientRect()) {
-  invalidatePreview();
+/** The caption tier for a scale, with hysteresis so a zoom resting on a threshold cannot flap. */
+function captionTierFor(s) {
+  if (s < (captionTier === 'far' ? 0.36 : 0.30)) return 'far';
+  return s > (captionTier === 'near' ? 1.10 : 1.20) ? 'near' : 'mid';
+}
+/** Give one tile a caption tier. A settled tile costs one property compare. */
+function applyCaptionTier(node, tier = captionTier) {
+  if (node._captionTier === tier) return;
+  node._captionTier = tier;
+  node.classList.toggle('z-far', tier === 'far');
+  node.classList.toggle('z-near', tier === 'near');
+}
+function onViewportChange(v, stageRect) { perf.span('camera/change', () => onViewportChangeNow(v, stageRect)); }
+function onViewportChangeNow(v, stageRect = el.stage.getBoundingClientRect()) {
+  // A hover preview ends when the camera moves. A zoom preview stays through
+  // the gesture and is decided again when it lands, so a pinch cannot flicker it.
+  if (previewByZoom) previewPoint = null; else invalidatePreview();
+  scheduleZoomDetail();
   syncOverview();
   const s = v.scale;
   const now = performance.now();
@@ -968,6 +1187,10 @@ function onViewportChange(v, stageRect = el.stage.getBoundingClientRect()) {
     // A zoom is easing: apply the scale-dependent styles once it lands.
     clearTimeout(scaleStyleTimer);
     scaleStyleTimer = setTimeout(() => applyScaleStyles(viewport.scale), viewport.settlesAt - now + 20);
+  } else if (viewport.zooming) {
+    // A pinch or edge zoom writes every frame and has no landing time; its end
+    // calls back here once more, and the styles apply then.
+    clearTimeout(scaleStyleTimer); scaleStyleTimer = 0;
   } else applyScaleStyles(s);
   if (state.background.mounted) state.background.stage = { w: stageRect.width, h: stageRect.height };
   updateVisibility({ rect: stageRect, defer: true });
@@ -991,7 +1214,7 @@ function selectFacetValue(key, value, add = false) {
   const next = add && current ? new Set(current) : new Set();
   if (add && current?.has(value)) next.delete(value); else next.add(value);
   state.active.set(key, next);
-  buildFacetRail(); applyFilters();
+  applyFilters();
 }
 
 /** Narrow the working set to one group of the current grouping (Shift adds it to the current values). */
@@ -1003,7 +1226,7 @@ function selectGroup(value, add = false) {
   const next = add && current ? new Set(current) : new Set();
   next.add(value);
   state.active.set(key, next);
-  closeDetail(); buildFacetRail(); applyFilters();
+  closeDetail(); applyFilters();
 }
 
 /* ------------------------------------------------------------- showcase --- */
@@ -1044,9 +1267,13 @@ function flowCard(key, p) {
 function flowShow(card, clip) {
   const [a, b] = card.querySelectorAll('img');
   const next = a.classList.contains('on') ? b : a, prev = next === a ? b : a;
-  next.src = clip.cover || clip.media?.[0]?.src || '';
   const swap = () => { next.classList.add('on'); prev.classList.remove('on'); };
-  if (next.complete && next.naturalWidth) swap(); else next.onload = swap;
+  const show = src => { next.src = src || ''; if (next.complete && next.naturalWidth) swap(); else next.onload = swap; };
+  const file = clip.cover || clip.media?.[0]?.src;
+  if (spriteCovers.has(clip)) {
+    const token = next.dataset.token = String(Number(next.dataset.token || 0) + 1);
+    void spriteCovers.coverUrl(clip, devicePx(Math.max(card.clientWidth, card.clientHeight) || 480), file).then(url => { if (next.dataset.token === token) show(url); });
+  } else show(file);
   card._clip = clip; card.setAttribute('aria-label', clip.title || 'clip'); card.querySelector('.cap .t').textContent = clip.title || '(untitled)';
 }
 function showcaseTick() {
@@ -1189,7 +1416,7 @@ function updateRowTitle(stageRect) {
     rowTitle.querySelector('strong').textContent = best.b.label || 'Ungrouped';
     rowTitle.querySelector('.n').textContent = String(best.b.count);
     rowTitle.querySelector('.pos').textContent = `${index + 1} of ${n}`;
-    rowTitle.querySelector('.rt-focus').setAttribute('aria-label', `${best.b.label}, ${best.b.count} items, group ${index + 1} of ${n}${best.layer === 'context' ? ', on the context plane. Filter to this group' : '. Approach this group'}`);
+    rowTitle.querySelector('.rt-focus').setAttribute('aria-label', `${best.b.label}, ${counted(best.b.count, state.nouns)}, group ${index + 1} of ${n}${best.layer === 'context' ? ', on the context plane. Filter to this group' : '. Approach this group'}`);
     rowTitle.dataset.layer = best.layer;
     rowTitle.hidden = false;
     rowTitleWidth = rowTitle.offsetWidth; // measured only when the text changes
@@ -1265,10 +1492,14 @@ function updateVisibility({ rect = null, defer = false } = {}) {
   // While an eased zoom is still landing, decodes would pop in mid-flight.
   const motionEnd = Math.max(viewport.settlesAt, layoutMotionUntil);
   const inFlight = now < motionEnd;
-  const load = !inFlight && (!defer || now - lastLoadFlush > 250);
+  // A pinch or edge zoom has no landing time; its end calls updateVisibility
+  // again through the camera, so nothing is scheduled while it runs.
+  const zooming = viewport.zooming;
+  const load = !inFlight && !zooming && (!defer || now - lastLoadFlush > 250);
   if (load) { lastLoadFlush = now; clearTimeout(loadTimer); loadTimer = 0; }
+  else if (zooming) { clearTimeout(loadTimer); loadTimer = 0; }
   else { clearTimeout(loadTimer); loadTimer = setTimeout(() => { loadTimer = 0; updateVisibility(); }, inFlight ? motionEnd - now + 30 : 120); }
-  revealTiles(r, state.tileEls, state.positions, load);
+  perf.span(load ? 'camera/reveal+load' : 'camera/reveal', () => revealTiles(r, state.tileEls, state.positions, load));
   if (state.background.mounted) {
     // Perspective shrinks the plane toward the stage centre, so a world rect
     // that is off the flat canvas can still be on screen: cull generously.
@@ -1281,10 +1512,19 @@ function revealTiles(r, tileEls, positions, load) {
   // guarded so a settled tile costs one rectangle test and nothing else: a
   // redundant `visibility` write still dirties style, and querySelector on
   // 1,800 tiles per frame was a measurable slice of every pan.
+  // A tile entering view while a zoom is still travelling takes the tier it
+  // will land in, so the landing does not restyle it a second time; tiles
+  // already in view keep theirs until the landing.
+  const travelling = performance.now() < viewport.settlesAt || viewport.zooming;
+  const tier = travelling ? captionTierFor(viewport.scale) : captionTier;
   for (const [id, node] of tileEls) {
     const p = positions.get(id);
     if (!p) continue;
     const visible = p.x < r.x + r.w && p.x + p.w > r.x && p.y < r.y + r.h && p.y + p.h > r.y;
+    // The caption tier lands only on tiles in view (applyScaleStyles); a tile
+    // takes it here, before the visibility write, so it is never seen stale.
+    // Background tiles never show captions.
+    if (visible && tileEls === state.tileEls && !(travelling && p.shown)) applyCaptionTier(node, tier);
     if (p.shown !== visible) { p.shown = visible; node.style.visibility = visible ? '' : 'hidden'; }
     if (!visible || !load) continue;
     if (viewport.scale >= 0.30) {
@@ -1296,8 +1536,19 @@ function revealTiles(r, tileEls, positions, load) {
     // position record, which is rebuilt with every layout.
     const img = p.img ?? (p.img = node.firstElementChild?.tagName === 'IMG' ? node.firstElementChild : null);
     if (!img) { p.loaded = true; continue; }
+    if (img.dataset.sprite !== undefined) {
+      if (spriteCovers.serves(p.clip, devicePx(Math.max(p.w, p.h) * viewport.scale))) { revealSprite(node, id, p, positions); continue; }
+      // Its cells' pages failed: the file loads below. With no file there is nothing left to show.
+      if (img.dataset.file) { img.dataset.src = img.dataset.file; delete img.dataset.file; }
+      if (img.dataset.fileSrcset) { img.dataset.srcset = img.dataset.fileSrcset; delete img.dataset.fileSrcset; }
+      if (!img.dataset.src && !img.dataset.srcset && !img.currentSrc) { node.classList.add('broken'); p.loaded = true; continue; }
+    }
     const sizes = `${Math.max(1, Math.ceil(p.w * viewport.scale))}px`;
     if (!img.dataset.src && (!img.dataset.srcset || (img.srcset && img.sizes === sizes))) continue;
+    // The overview paints this tile from a baked page at this zoom; its own
+    // file waits for a reading zoom (docs/PERF.md, "Overview sheets"). Not
+    // marked loaded, so zooming in re-evaluates it.
+    if (!img.currentSrc && overview.coversWithoutDom(node, p.sheetSource ??= overviewSource(p.clip), p.w * viewport.scale, viewport.scale)) continue;
     // Spend decode slots on the biggest visible imagery, not DOM insertion order.
     const current = () => node.isConnected && p.shown && positions.get(id) === p
       && positions === (node.classList.contains('bg') ? state.bgPositions : state.positions);
@@ -1331,94 +1582,113 @@ function revealTiles(r, tileEls, positions, load) {
   }
 }
 
-/* -------------------------------------------------------------- facets --- */
-
-function buildFacetRail() {
-  el.rail.replaceChildren();
-  const keys = [
-    ...facetOrder.filter((k) => state.facets[k]),
-    ...Object.keys(state.facets).filter((k) => !facetOrder.includes(k) && !FACET_BLOCKLIST.has(k))
-  ];
-
-  for (const key of keys) {
-    const all = Object.entries(state.facets[key] || {});
-    if (all.length < 2) continue;   // a facet with one value filters nothing
-    // A long tail of rare values (one-album artists) is noise as chips and is
-    // better reached by search. Keep the most frequent, plus anything active.
-    const active = state.active.get(key) || new Set();
-    const keep = new Set(all.slice().sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, FACET_CHIP_LIMIT).map(([v]) => v));
-    const values = all.filter(([v]) => keep.has(v) || active.has(v));
-    const dropped = all.length - values.length;
-    values.sort((a, b) => key === 'captured' || key === 'year'
-      ? b[0].localeCompare(a[0]) : b[1] - a[1] || a[0].localeCompare(b[0]));
-
-    const section = document.createElement('div');
-    section.className = 'facet';
-    const h3 = document.createElement('h3');
-    const heading = document.createElement('button'); heading.type = 'button'; heading.className = 'facet-heading'; heading.dataset.attribute = key;
-    heading.textContent = state.facetLabels[key] || key;
-    brush.bindHeading(heading, key);
-    h3.append(heading);
-    const chips = document.createElement('div');
-    chips.className = 'chips';
-
-    for (const [value, n] of values) {
-      const chip = document.createElement('button');
-      chip.className = 'chip';
-      chip.type = 'button';
-      chip.setAttribute('aria-pressed', String(state.active.get(key)?.has(value) || false));
-      chip.dataset.facet = key; chip.dataset.value = value; chip.dataset.total = String(n);
-      const label = document.createElement('span');
-      label.textContent = value;                     // untrusted
-      const num = document.createElement('span');
-      num.className = 'n';
-      num.textContent = String(n);
-      chip.append(label, num);
-      brush.bindValue(chip, key, value);
-      chip.addEventListener('click', () => toggleFacet(key, value, chip));
-      chips.append(chip);
+/**
+ * A tile whose cover exists only as sprite-sheet cells (sprite-covers.mjs).
+ * Its <img> gets the cell of the smallest level that holds the tile's drawn
+ * size, and moves up a level, never down, when a zoom needs more pixels.
+ * `data-sprite` records the level edge on screen (0: none yet).
+ */
+function revealSprite(node, id, p, positions) {
+  const need = devicePx(Math.max(p.w, p.h) * viewport.scale);
+  const cell = spriteCovers.cellFor(p.clip, need);
+  if (!cell) { p.loaded = true; return; }
+  const shown = Number(p.img.dataset.sprite) || 0;
+  if (shown >= cell.edge) { if (shown >= spriteCovers.maxEdge(p.clip)) p.loaded = true; return; }
+  // The overview paints this tile from the sheets at this zoom.
+  if (!shown && overview.coversWithoutDom(node, p.sheetSource ??= overviewSource(p.clip), p.w * viewport.scale, viewport.scale)) return;
+  const current = () => node.isConnected && p.shown && positions.get(id) === p
+    && positions === (node.classList.contains('bg') ? state.bgPositions : state.positions);
+  imageWork.add(node, p.w * p.h * viewport.scale ** 2, current, async () => {
+    // Boot and every filter reveal at the old scale and fit in the same next
+    // frame this work starts in. Wait one frame more and leave a moving camera
+    // to its landing, which reveals again: at the fitted scale the overview
+    // paints every tile, and a full-size page would be fetched for nothing.
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    if (performance.now() < viewport.settlesAt || viewport.zooming || !current()) return;
+    const img = p.img;
+    const scale = viewport.scale, need = devicePx(Math.max(p.w, p.h) * scale), on = Number(img?.dataset.sprite) || 0;
+    if (!on && overview.coversWithoutDom(node, p.sheetSource ??= overviewSource(p.clip), p.w * scale, scale)) return;
+    const cell = spriteCovers.cellFor(p.clip, need);
+    if (!cell) { updateVisibility(); return; } // its page failed meanwhile: the file, or another level
+    if (!img || node.firstElementChild !== img || on >= cell.edge) return;
+    const url = await spriteCovers.url(p.clip, need);
+    // A page that failed withdrew its cells; revealing again picks another
+    // level, or the clip's file.
+    if (!url) { if (current()) updateVisibility(); return; }
+    if (!current() || node.firstElementChild !== img) return;
+    if (img.naturalWidth > 0) {
+      // Keep the smaller cell on screen until the larger one has decoded.
+      const next = img.cloneNode(false);
+      next.dataset.sprite = String(cell.edge); next.src = url;
+      try { await next.decode(); } catch { return; }
+      if (!current() || node.firstElementChild !== img) return;
+      next.addEventListener('error', () => node.classList.add('broken'), { once: true });
+      img.replaceWith(next); p.img = next;
+      overview.replaceImage(node, next);
+      return;
     }
-    if (dropped > 0) {
-      const more = document.createElement('button'); more.type = 'button'; more.className = 'chip chip-more';
-      more.textContent = `${dropped} more · search`;
-      more.addEventListener('click', () => el.search.focus());
-      chips.append(more);
-    }
-    section.append(h3, chips);
-    el.rail.append(section);
-  }
+    img.dataset.sprite = String(cell.edge); img.src = url;
+    try { await img.decode(); } catch {} // The tile's error placeholder is authoritative.
+  });
 }
 
-function toggleFacet(key, value, chip) {
+/* -------------------------------------------------------------- facets --- */
+
+let facetRail = null;
+function buildFacetRail() { perf.span('rail/update', () => {
+  facetRail ||= createFacetRail({ host: el.rail, brush,
+    getLabel: key => state.facetLabels[key] || key,
+    onToggle: toggleFacet, onClear: clearFacet, pageSize: FACET_CHIP_LIMIT });
+  const keys = [...new Set([
+    ...facetOrder.filter(key => state.facets[key]),
+    ...Object.keys(state.facets), ...state.active.keys()
+  ])].filter(key => !FACET_BLOCKLIST.has(key));
+  facetRail.update(buildFacetModel(state.clips, state, { keys, catalog: state.facets }));
+}); }
+
+function toggleFacet(key, value) {
   rememberScope();
-  if (!state.active.has(key)) state.active.set(key, new Set());
-  const set = state.active.get(key);
-  const on = set.has(value);
-  if (on) set.delete(value);
-  else set.add(value);
-  chip.setAttribute('aria-pressed', String(!on));
+  const next = new Set(state.active.get(key));
+  if (next.has(value)) next.delete(value); else next.add(value);
+  if (next.size) state.active.set(key, next); else state.active.delete(key);
   applyFilters();
   closeRailIfNarrow();
 }
 
+function clearFacet(key) {
+  if (!state.active.get(key)?.size) return;
+  rememberScope(); state.active.delete(key); applyFilters();
+}
+
+function removeFacetValue(key, value) {
+  if (!state.active.get(key)?.has(value)) return;
+  toggleFacet(key, value);
+  document.getElementById('scope-back').focus({ preventScroll: true });
+}
+
 function buildGroupOptions() {
-  const keys = ['none', ...facetOrder.filter((k) => state.facets[k])];
+  const keys = ['none', ...facetOrder.filter((k) => state.facets[k] && !FACET_BLOCKLIST.has(k))];
   for (const k of Object.keys(state.facets)) {
     if (FACET_BLOCKLIST.has(k) || keys.includes(k)) continue;
     // Grouping by a near-unique key produces one block per clip; useless.
     if (Object.keys(state.facets[k]).length <= 24) keys.push(k);
   }
+  // Arrangements rather than facets: offered when the index carries projection points / grid cells.
+  if (state.clips.some(hasCell)) keys.splice(1, 0, SIMILARITY_GRID);
+  if (state.clips.some(hasProjection)) keys.splice(1, 0, SIMILARITY);
   el.group.replaceChildren();
   for (const k of keys) {
     const opt = document.createElement('option');
     opt.value = k;
-    opt.textContent = k === 'none' ? 'no grouping' : state.facetLabels[k] || k;
+    opt.textContent = k === 'none' ? 'no grouping' : k === SIMILARITY ? 'similarity map' : k === SIMILARITY_GRID ? 'similarity grid' : state.facetLabels[k] || k;
     el.group.append(opt);
   }
 }
 
+/** Attributes a reader can sort, lens or place on a floating-space axis by, in facet order. */
+const attributeKeys = () => [...new Set([...facetOrder, ...Object.keys(state.facets)].filter(k => !FACET_BLOCKLIST.has(k) && Object.keys(state.facets[k] || {}).length))];
 function buildReviewControls() {
-  const keys = ['title', ...new Set([...facetOrder, ...Object.keys(state.facets)].filter(k => !FACET_BLOCKLIST.has(k) && Object.keys(state.facets[k] || {}).length))];
+  const keys = ['title', ...attributeKeys()];
   for (const [id, value, label] of [['sort-key', state.sort.key, 'Original order'], ['attribute-lens', brush.getPinned() || 'none', 'No lens']]) {
     const select = document.getElementById(id); select.replaceChildren();
     for (const key of ['none', ...keys, ...(!keys.includes(value) && value !== 'none' ? [value] : [])]) {
@@ -1428,24 +1698,37 @@ function buildReviewControls() {
     }
     select.value = value;
   }
-  updateSortDirection();
+  updateSortDirection();syncLensValue();
 }
+function syncLensValue() {
+  const select=document.getElementById('lens-value'),key=brush.getPinned(),value=brush.getPinnedValue();
+  select.hidden=!key || lensless(state.mode);
+  if(!key){select.replaceChildren();return;}
+  select.replaceChildren(new Option('All values',''));
+  // Values use the filter's canonical form (captured dates are month prefixes).
+  const values=[...new Set(state.filtered.flatMap(clip=>valuesOf(clip,key)).map(String).filter(v=>v.trim()))].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+  if(value!==null&&!values.includes(value))values.unshift(value);
+  for(const label of values)select.append(new Option(label,label));
+  select.value=value||'';
+}
+document.getElementById('lens-value').addEventListener('change',e=>brush.setPinned(brush.getPinned(),e.target.value||null));
 function updateSortDirection() {
   const button = document.getElementById('sort-direction');
   const asc = state.sort.direction === 'asc';
   button.textContent = asc ? '↑' : '↓';
   button.setAttribute('aria-label', asc ? 'Sort ascending; reverse to descending' : 'Sort descending; reverse to ascending');
-  button.disabled = state.spatialOn || state.sort.key === 'none';
+  button.disabled = lensless(state.mode) || state.sort.key === 'none';
 }
 function setSort(key, direction = state.sort.direction) {
-  if (state.spatialOn) return;
+  if (lensless(state.mode)) return;
   rememberScope();
   clearTrayReturn(); invalidatePreview();
-  state.sort = { key, direction };
+  state.sort = { key, direction };state.aisleDirty=true;
   document.getElementById('sort-key').value = key;
   updateSortDirection();
   state.layoutAspect = null;
-  render(); viewport.fit();
+  if(state.mode==='aisle'){state.flatDirty=true;refreshSpatial();updateReviewOrder();}
+  else {render();viewport.fit();}
 }
 document.getElementById('sort-key').addEventListener('change', e => setSort(e.target.value));
 document.getElementById('sort-direction').addEventListener('click', () => setSort(state.sort.key, state.sort.direction === 'asc' ? 'desc' : 'asc'));
@@ -1473,6 +1756,9 @@ const PREVIEW_DWELL = 500;
 // this; the grace only has to outlast the gap between the two.
 const PREVIEW_LINGER = 320;
 let previewTimer = null, previewMedia = null, previewPoint = null;
+// True while the preview was opened by zooming in rather than by a hover dwell.
+// It is still only `state.preview`: no selection, no ViewSpec, no camera move.
+let previewByZoom = false;
 function invalidatePreview() {
   previewPoint = null;
   endPreview();
@@ -1497,6 +1783,7 @@ function hoverPreview(clip, e) {
 function showPreview(clip) {
   if (!state.selected || clip.id === state.selected) return;
   if (state.preview === null) previewMedia = state.detailMedia;  // hold the committed frame
+  previewByZoom = false;
   state.preview = clip.id;
   state.detailMedia = null;
   el.detail.dataset.preview = 'true';
@@ -1506,19 +1793,80 @@ function showPreview(clip) {
 /** Leaving a tile ends the preview, unless the pointer is on its way into the pane. */
 function hoverEnd() {
   clearTimeout(previewTimer);
+  if (previewByZoom) return;                                // zooming out ends a zoom preview, not the pointer
   previewTimer = setTimeout(() => endPreview(), PREVIEW_LINGER);
 }
 
 function endPreview({ silent = false } = {}) {
   clearTimeout(previewTimer);
   if (state.preview === null) return;
-  state.preview = null;
+  const byZoom = previewByZoom;
+  state.preview = null; previewByZoom = false;
   state.detailMedia = previewMedia; previewMedia = null;
   delete el.detail.dataset.preview;
   if (silent) return;                                       // caller renders its own clip next
+  if (byZoom && !state.selected) { detailPane.close(); return; }  // the pane was the preview's alone
   const clip = state.clips.find(c => c.id === state.selected);
   if (clip) renderDetail(clip);
 }
+
+/* Details on zoom (ledger idea 27; rule in zoom-detail.mjs) ----------------
+ * Zooming in until one cover dominates the free view previews it in the pane
+ * with no click; zooming out ends that preview. It is decided only once the
+ * camera has been still for ZOOM_DETAIL_QUIET after a zoom lands, never per
+ * frame of a pinch or wheel run. It rides the preview path, so it commits no
+ * selection, scope, view state or permalink, and it never moves the camera:
+ * the pane overlays the fixed stage and the rule centres on the uncovered part.
+ * Without a selection the pane opens for the preview alone and closes with it.
+ * The 3D view has no equivalent: approach there promotes covers to DOM cards
+ * that already carry title, source, date and tags (docs/ZOOM_DETAIL.md).
+ */
+const ZOOM_DETAIL_QUIET = 120;
+let zoomDetailTimer = 0;
+// An item whose zoom preview the user dismissed (Escape, ×). It stays dismissed
+// until the view zooms out past the close threshold or centres another item.
+let zoomDismissed = null;
+function scheduleZoomDetail() {
+  clearTimeout(zoomDetailTimer); zoomDetailTimer = 0;
+  if (state.spatialOn || viewport.zooming) return;          // a pinch's end calls back here once more
+  const wait = Math.max(0, viewport.settlesAt - performance.now()) + ZOOM_DETAIL_QUIET;
+  zoomDetailTimer = setTimeout(applyZoomDetail, wait);
+}
+function applyZoomDetail() {
+  zoomDetailTimer = 0;
+  if (state.preview && !previewByZoom) return;              // a hover preview is the user's more recent intent
+  const stage = el.stage.getBoundingClientRect();
+  // 3D, the full-window mobile reader and hydration never preview by zoom.
+  // Zoomed all the way out is never zoomed in, however few items fill the view.
+  const floor = viewport.scaleFloor?.(), atFloor = viewport.fitted || (floor > 0 && viewport.scale <= floor * 1.01);
+  const pick = state.spatialOn || hydrating || atFloor || window.innerWidth <= 800 ? null
+    : zoomDetailCandidate({
+      tiles: state.positions.values(), pose: viewport.snapshot(), stage,
+      // The pane's width whether or not it is open, so opening it moves nothing.
+      rail: stage.right - (window.innerWidth - el.detail.offsetWidth),
+      current: previewByZoom ? state.preview : zoomDismissed,
+      open: previewByZoom || !!zoomDismissed,
+    });
+  if (!pick) { zoomDismissed = null; if (previewByZoom) endPreview(); return; }
+  if (pick.id === zoomDismissed) return;
+  zoomDismissed = null;
+  if (pick.id === state.selected) { if (previewByZoom) endPreview(); return; }
+  if (previewByZoom && pick.id === state.preview) return;
+  const clip = state.clips.find(c => c.id === pick.id);
+  if (clip) showZoomPreview(clip);
+}
+function showZoomPreview(clip) {
+  if (state.selected) { showPreview(clip); previewByZoom = true; return; }
+  clearTimeout(previewTimer);
+  if (state.preview === null) previewMedia = state.detailMedia;
+  state.preview = clip.id; previewByZoom = true;
+  state.detailMedia = null;
+  el.detail.dataset.preview = 'true';
+  renderDetail(clip);
+  detailPane.open();
+}
+/** The user put a zoom preview away; do not reopen it at the next landing. */
+function dismissZoomPreview() { if (previewByZoom) zoomDismissed = state.preview; }
 
 /** Promote the previewed clip to the selection. */
 function commitPreview() {
@@ -1538,10 +1886,10 @@ el.detail.addEventListener('click', (e) => {
 });
 
 function itemSource(clip, pose = null, sourceNode = null) {
-  if (state.spatialOn) return { sourceRect: state.spatial?.originRectangle(clip), sourceSrc: clip.cover };
+  if (state.spatialOn) return { sourceRect: activeSpatial()?.originRectangle(clip), sourceSrc: spriteCovers.peekUrl(clip) || clip.cover };
   const hintedImage = sourceNode?.isConnected && sourceNode.querySelector('img');
   if (hintedImage && !pose) return { source: hintedImage, sourceRect: hintedImage.getBoundingClientRect(),
-    sourceSrc: hintedImage.currentSrc || hintedImage.src || clip.cover };
+    sourceSrc: hintedImage.currentSrc || hintedImage.src || spriteCovers.peekUrl(clip) || clip.cover };
   // Background perspective is not flat world geometry. The lift retains its
   // captured origin for exact return instead of borrowing a foreground copy.
   if (pose && sourceNode?.classList.contains('bg')) return {};
@@ -1555,7 +1903,7 @@ function itemSource(clip, pose = null, sourceNode = null) {
   return { source: pose ? null : source,
     sourceRect: { left: r.left + camera.x + t.x * camera.scale, top: r.top + camera.y + t.y * camera.scale,
       width: t.w * camera.scale, height: t.h * camera.scale },
-    sourceSrc: source?.currentSrc || source?.src || clip.cover };
+    sourceSrc: source?.currentSrc || source?.src || spriteCovers.peekUrl(clip) || clip.cover };
 }
 function exposeReadingItem(clip, sourceNode = null) {
   if (state.spatialOn || window.innerWidth <= 800 || sourceNode?.classList.contains('bg')) return;
@@ -1572,17 +1920,20 @@ function exposeReadingItem(clip, sourceNode = null) {
   }
 }
 /** Commit a clip as the selection and show it. The only path that writes state.selected. */
-function openDetail(clip, { sourceNode = null } = {}) {
+function openDetail(clip, opts) { perf.span('detail/open', () => openDetailNow(clip, opts)); }
+function openDetailNow(clip, { sourceNode = null } = {}) {
   const origin = itemSource(clip, null, sourceNode);
   if (!state.selected) state.detailReturn = { camera: viewport.visiblePose(), epoch: state.layoutEpoch,
     focus: document.activeElement, sourceNode, selected: clip.id, width: window.innerWidth, height: window.innerHeight };
   if (!state.spatialOn) viewport.fitted = false;
   readerLift.cancel(); readerMedia.cancel();
-  state.spatial?.cancelHover?.();
+  activeSpatial()?.cancelHover?.();
   previewPoint = null;
   endPreview({ silent: true });
   state.unresolvedFocus = null; state.detailMedia = null;
   state.selected = clip.id;
+  state.aisle?.setFocused?.(clipKey(clip));
+  state.float?.setFocused?.(clipKey(clip));
   for (const [key, node] of state.tileEls) node.classList.toggle('selected', state.positions.get(key)?.clip.id === clip.id);
   for (const [key, node] of state.bgTileEls) node.classList.toggle('selected', state.bgPositions.get(key)?.clip.id === clip.id);
   renderDetail(clip);
@@ -1616,16 +1967,30 @@ function renderDetail(clip) {
     nav.append(prev, pos, next); d.append(nav);
   }
 
+  // A cover served by sprite-sheet cells shows what the tile already holds,
+  // then the largest cell, or the file if that cell's page fails. A
+  // detailCover file still wins.
+  const sprite = !clip.detailCover && spriteCovers.has(clip);
   const cover = clip.detailCover || clip.cover || clip.media?.[0]?.src;
-  if (cover) {
+  if (cover || sprite) {
     const img = document.createElement('img');
     img.alt = '';
     img.decoding = 'async';
     img.draggable = false;
     d.append(img);
     const origin = itemSource(clip);
-    void readerMedia.prepareImage(img, clip, { thumbnail: origin.sourceSrc || clip.cover });
-    if (order.length && at >= 0) readerMedia.prefetch([order[(at + 1) % order.length], order[(at - 1 + order.length) % order.length]]);
+    if (sprite) {
+      if (origin.sourceSrc) img.src = origin.sourceSrc;
+      void spriteCovers.coverUrl(clip, Infinity, cover).then(src => {
+        if (src && img.isConnected) void readerMedia.prepareImage(img, clip, { thumbnail: img.getAttribute('src') || src, src });
+      });
+    } else void readerMedia.prepareImage(img, clip, { thumbnail: origin.sourceSrc || clip.cover });
+    if (order.length && at >= 0) {
+      const near = [order[(at + 1) % order.length], order[(at - 1 + order.length) % order.length]];
+      // Cells are prefetched as cells, not as the files they stand in for.
+      readerMedia.prefetch(near.filter(next => !spriteCovers.has(next) || next.detailCover));
+      for (const next of near) if (spriteCovers.has(next) && !next.detailCover) void spriteCovers.url(next);
+    }
   }
 
   const h2 = document.createElement('h2');
@@ -1690,6 +2055,27 @@ function renderDetail(clip) {
   if (clip.editUri) actions.append(linkButton('Edit in Obsidian', clip.editUri, false));
   d.append(actions);
 
+  // Duplicates the server collapsed into this tile (lib/dedupe.mjs) stay reachable here.
+  if (Array.isArray(clip.alsoAt) && clip.alsoAt.length) {
+    const also = document.createElement('details');
+    also.className = 'also-at';
+    const summary = document.createElement('summary');
+    summary.textContent = `${clip.alsoAt.length} more with the same page or image`;
+    const list = document.createElement('ul');
+    for (const other of clip.alsoAt) {
+      if (!/^https?:\/\//i.test(String(other?.url))) continue;
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = other.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.textContent = other.title || other.url;
+      li.append(a);
+      if (other.source || other.captured) li.append(document.createTextNode(` · ${[other.source, other.captured].filter(Boolean).join(' · ')}`));
+      list.append(li);
+    }
+    also.append(summary, list);
+    d.append(also);
+  }
+
   if (Array.isArray(clip.palette)) {
     const palette = document.createElement('div');
     palette.className = 'palette';
@@ -1752,7 +2138,8 @@ function linkButton(text, href, external) {
 }
 
 /** Open the neighbouring item in review order and bring its tile under the camera at the current scale. */
-function stepDetail(delta) {
+function stepDetail(delta) { perf.span('detail/step', () => stepDetailNow(delta)); }
+function stepDetailNow(delta) {
   const order = state.order || [];
   const i = order.findIndex(c => c.id === state.selected);
   if (i < 0 || order.length < 2) return;
@@ -1760,10 +2147,39 @@ function stepDetail(delta) {
   openDetail(clip);
   if (state.spatialOn) return;
   const p = [...state.positions.values()].find(t => t.clip.id === clip.id);
-  if (!p) return;
+  if (p) centreOnTile(p);
+}
+/** Bring a laid-out tile under the camera, centred in the area left of the pane. */
+function centreOnTile(p) {
   const r = el.stage.getBoundingClientRect(), s = viewport.scale;
   const width = Math.max(120, Math.min(r.width, el.detail.getBoundingClientRect().left - r.left));
   viewport.panTo(width / 2 - (p.x + p.w / 2) * s, r.height / 2 - (p.y + p.h / 2) * s, { duration: 220 });
+}
+/**
+ * Up/Down with a detail open: move to the nearest tile above or below the
+ * selection in the laid-out grid, as Left/Right walk the review order. "Nearest"
+ * prefers tiles whose column overlaps the current one, then the smallest gap,
+ * so a step lands on the visible neighbour rather than the next item in order.
+ * Flat wall only; the spatial view has no grid to walk. No-op at the edge.
+ */
+function stepDetailVertical(dir) {
+  if (state.spatialOn) return;
+  const tiles = [...state.positions.values()];
+  const from = tiles.find(t => t.clip.id === state.selected);
+  if (!from) return;
+  const fromMid = from.x + from.w / 2;
+  let best = null, bestScore = Infinity;
+  for (const t of tiles) {
+    if (t.clip.id === state.selected) continue;
+    const gap = dir > 0 ? t.y - (from.y + from.h) : from.y - (t.y + t.h);
+    if (gap < -1) continue;                                  // not beyond the edge in that direction
+    const apart = Math.max(0, Math.max(t.x, from.x) - Math.min(t.x + t.w, from.x + from.w));
+    const score = gap + 3 * apart + 0.1 * Math.abs(t.x + t.w / 2 - fromMid);
+    if (score < bestScore) { bestScore = score; best = t; }
+  }
+  if (!best) return;
+  openDetail(best.clip);
+  centreOnTile(best);
 }
 // Swipe across the detail pane steps through the review order (phones).
 { let start = null;
@@ -1772,7 +2188,10 @@ function stepDetail(delta) {
     if (Math.abs(dx) > 60 && Math.abs(dx) > 2 * Math.abs(dy)) stepDetail(dx < 0 ? 1 : -1); });
   el.detail.addEventListener('pointercancel', () => { start = null; }); }
 
-function closeDetail() {
+function closeDetail() { perf.span('detail/close', closeDetailNow); }
+function closeDetailNow() {
+  // Closing while zoomed in must not have the next landing reopen what was just put away.
+  zoomDismissed = (previewByZoom && state.preview) || state.selected || zoomDismissed;
   const clip = state.clips.find(c => c.id === state.selected), back = state.detailReturn;
   const recover = back && back.epoch === state.layoutEpoch && back.width === window.innerWidth && back.height === window.innerHeight;
   endPreview();
@@ -1796,6 +2215,7 @@ function showEmpty(title, detail) {
   el.empty.append(h2);
   if (detail) {
     const p = document.createElement('p');
+    p.style.whiteSpace = 'pre-line'; // a collection's problems arrive one per line
     p.textContent = detail;
     el.empty.append(p);
   }
@@ -1809,25 +2229,37 @@ function showEmpty(title, detail) {
 
 /* --------------------------------------------------------------- input --- */
 
+// At most one filter per frame, with the latest value. Filtering inside each
+// keystroke's handler made the next key queue behind the whole filter and render
+// (the third key of three waited 137 ms before its handler ran).
+let searchFrame = 0;
 el.search.addEventListener('input', () => {
+  if (!searchFrame) searchFrame = requestAnimationFrame(applySearch);
+});
+function applySearch() {
+  searchFrame = 0;
+  // A restore or a cluster choice may have set the query since the keystroke.
+  if (el.search.value === state.query) return;
   if (!state.scopeHistory.length || state.scopeHistory.at(-1).query === state.query) rememberScope();
   // Search is the first focus: the place you searched from becomes the context
   // plane, results are the focus, and matches light up where they were.
   if (!state.query.trim() && el.search.value.trim()) state.contextBase = { clips: state.filtered.slice(), label: scopeLabel() };
   state.query = el.search.value;
   applyFilters();
-});
+}
 
 el.group.addEventListener('change', () => {
   clearTrayReturn(); invalidatePreview();
   state.arrangementOverride = null; state.layoutAspect = null;
   state.groupKey = el.group.value;
-  state.spatialDirty = true;
-  if (state.spatialOn && state.spatial) {
-    if (state.groupKey === 'none') state.spatial.showMountain();
-    else state.spatial.showPiles(state.groupKey);
+  state.spatialDirty = state.aisleDirty = true;
+  if(state.mode==='aisle')refreshSpatial();
+  else if (state.spatialOn && state.spatial) {
+    if (piled(state.groupKey)) state.spatial.showPiles(state.groupKey);
+    else state.spatial.showMountain(state.groupKey);
     saveViewState();
   }
+  syncArrangement();
   if (state.spatialOn) { state.flatDirty = true; updateReviewOrder(); }
   else { render(); requestAnimationFrame(() => viewport.fit()); }
 });
@@ -1855,32 +2287,45 @@ el.stage.addEventListener('edge-pan', ({ detail }) => {
 document.getElementById('zoom-in').addEventListener('click', () => zoomBy(1.3));
 document.getElementById('zoom-out').addEventListener('click', () => zoomBy(1 / 1.3));
 function zoomBy(factor) {
-  if (state.spatialOn) state.spatial.zoomBy(factor);
+  if (state.spatialOn) activeSpatial().zoomBy(factor);
   else viewport.zoomBy(factor);
 }
 function fitWall() {
   clearTrayReturn(); invalidatePreview();
   state.layoutAspect = null;
-  if (state.spatialOn) state.spatial.fitView();
+  if (state.spatialOn) activeSpatial().fitView();
   else { setBackgroundRevealed(false); render(); viewport.fit(); }
 }
 document.getElementById('zoom-fit').addEventListener('click', fitWall);
 /** Phones: the rail is an overlay that starts closed and closes after a choice. */
 const narrow = () => matchMedia('(max-width: 700px) and (hover: none)').matches; // phones, not narrow desktop windows
-function closeRailIfNarrow() { if (narrow() && !el.rail.classList.contains('hidden')) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); } }
-if (narrow()) { el.rail.classList.add('hidden'); el.stage.classList.add('full'); }
+function closeRailIfNarrow() {
+  if (narrow() && !el.rail.classList.contains('hidden')) {
+    const ownsFocus = el.rail.contains(document.activeElement);
+    el.rail.classList.add('hidden'); el.stage.classList.add('full');
+    document.getElementById('toggle-rail').setAttribute('aria-expanded', 'false');
+    if (ownsFocus) document.getElementById('toggle-rail').focus({ preventScroll: true });
+  }
+}
+if (narrow()) {
+  el.rail.classList.add('hidden'); el.stage.classList.add('full');
+  document.getElementById('toggle-rail').setAttribute('aria-expanded', 'false');
+}
 document.getElementById('toggle-rail').addEventListener('click', () => {
   el.rail.classList.toggle('hidden');
   el.stage.classList.toggle('full');
+  document.getElementById('toggle-rail').setAttribute('aria-expanded', String(!el.rail.classList.contains('hidden')));
 });
 
-el.view3d.addEventListener('click', () => toggleSpatial(!state.spatialOn));
+el.view3d.addEventListener('click', () => toggleSpatial(state.mode!=='3d'));
+el.viewAisle.addEventListener('click',()=>toggleSpatial(state.mode!=='aisle','aisle'));
+el.viewFloat.addEventListener('click',()=>toggleSpatial(state.mode!=='float','float'));
 window.addEventListener('keydown', (e) => {
   // '3' only when not typing — the search box owns every printable key.
   if (e.key === '3' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement || e.target.isContentEditable)
       && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault();
-    toggleSpatial(!state.spatialOn);
+    toggleSpatial(state.mode!=='3d');
   }
 });
 
@@ -1890,12 +2335,13 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && el.detail.classList.contains('open')) {
     // Escape unwinds one level at a time: drop the preview back to the selected
     // clip first, and only close the pane once there is no preview to drop.
-    if (state.preview) endPreview(); else closeDetail();
+    if (state.preview) { dismissZoomPreview(); endPreview(); } else closeDetail();
     e.stopPropagation();
   }
 }, true);
 
 window.addEventListener('keydown', (e) => {
+  if(e.defaultPrevented)return;
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
     if (!state.spatialOn && viewport.undoEdge()) { e.preventDefault(); return; }
@@ -1903,12 +2349,21 @@ window.addEventListener('keydown', (e) => {
     closeDetail(); el.search.blur(); return;
   }
   if (typing) return;
-  if (state.preview && e.key === 'Enter' && !typing) { e.preventDefault(); commitPreview(); return; }
+  // Native controls and tile handlers own Enter. A zoom/hover preview must not
+  // intercept a focused scope-removal button or another deliberate action.
+  if (state.preview && e.key === 'Enter' && !e.defaultPrevented &&
+      !e.target.closest?.('button, a, input, select, textarea, [role="button"], [contenteditable]')) {
+    e.preventDefault(); commitPreview(); return;
+  }
 
   if (state.selected && (e.key === 'ArrowRight' || e.key === 'ArrowLeft') && !e.target.closest?.('.detail-resize')) {
     // The arrows walk the review order from the SELECTION, so a hover in flight
     // is dropped rather than silently becoming the thing you stepped from.
     e.preventDefault(); endPreview(); stepDetail(e.key === 'ArrowRight' ? 1 : -1); return;
+  }
+  // Up/Down walk the grid. Inside the pane they stay native, so a long note scrolls.
+  if (state.selected && !state.spatialOn && (e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.target.closest?.('#detail')) {
+    e.preventDefault(); endPreview(); stepDetailVertical(e.key === 'ArrowDown' ? 1 : -1); return;
   }
 
   if (e.key === '/') { e.preventDefault(); el.search.focus(); }
@@ -1925,18 +2380,32 @@ window.addEventListener('keydown', (e) => {
 // Repack an overview when its usable area changes, including the filter rail.
 // While exploring at a custom zoom, preserve the user's camera and positions;
 // the next Fit explicitly recomposes for the new viewport.
-new ResizeObserver(() => {
+new ResizeObserver(() => perf.span('resize/stage', () => {
+  stageSize = null;
   if (hydrating || links?.restoring) return;
-  if (!state.spatialOn && viewport.fitted) fitWall();
+  if (!state.spatialOn && viewport.fitted) {
+    const r = el.stage.getBoundingClientRect(); // layout is clean when observers run, so this does not force one
+    if (r.width === renderedStage?.w && r.height === renderedStage?.h) return;
+    fitWall();
+  }
   else { updateVisibility(); updateBackgroundVisibility(); }
-}).observe(el.stage);
+})).observe(el.stage);
 
+// A collection document (?collection=, a meta tag or an embedding page) replaces
+// the server: no /api/clips, no proxy, no snapshot store, view state in memory.
+const collection = collectionSource();
+if (collection) setProxyAvailable(false);
 // Edge zoom is the default flat-canvas behaviour; ?pan=free|bounded remain for comparison.
 const initialPan = new URL(location.href).searchParams.get('pan');
 const startPan = ['free', 'bounded', 'edge'].includes(initialPan) ? initialPan : 'edge';
 panBehavior.value = startPan;
 viewport.panMode = startPan;
-links = createPermalinks({ capture: captureView, restore: restoreView, notice: linkNotice, onHistory: renderScope });
+links = createPermalinks({ capture: captureView, restore: restoreView, notice: linkNotice, onHistory: renderScope, snapshots: !collection });
 document.getElementById('copy-view').addEventListener('click', () => links.copy().catch(err => linkNotice(err.message)));
+document.getElementById('copy-live-view').addEventListener('click',async()=>{try{const spec=captureView();if(!spec)throw new Error('The view is not ready');await navigator.clipboard.writeText(targetedViewURL(spec,location.href).href);linkNotice('Live view link copied · opens the current collection');}catch(error){linkNotice(error.message);}});
+// Read-only diagnostics for the explicit-target rendering proof.
+window.wunderkammer = Object.freeze({ export: exportView });
+window.wunderkammerAisleDebug=()=>({mode:state.mode,scopeKeys:state.filtered.map(clipKey),view:captureView(),scene:state.aisle?.getDiagnostics()||null});
+window.wunderkammerFloatDebug=()=>({mode:state.mode,scopeKeys:state.filtered.map(clipKey),view:captureView(),scene:state.float?.getDiagnostics()||null});
 document.getElementById('new-view').addEventListener('click', () => { links.newView(); linkNotice(''); });
 boot();

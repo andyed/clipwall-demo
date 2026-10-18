@@ -24,7 +24,7 @@ export class ViewStateStore {
   }
 
   async load() {
-    const res = await this.fetcher('api/view-state.json');
+    const res = await this.fetcher('/api/view-state');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const doc = await res.json();
     if (!doc || typeof doc !== 'object' || Array.isArray(doc)
@@ -41,7 +41,7 @@ export class ViewStateStore {
     const snapshot = structuredClone(doc);
     this.doc = snapshot;
     const write = this.pending.catch(() => {}).then(async () => {
-      const res = await this.fetcher('api/view-state.json', {
+      const res = await this.fetcher('/api/view-state', {
         method: 'PUT', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(snapshot),
       });

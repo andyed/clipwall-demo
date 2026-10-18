@@ -36,6 +36,11 @@ export function captureLayoutMotion(previous, { readTransform = node => getCompu
   return captured;
 }
 
+/** Nodes travelling on a layout animation right now. Their transforms move
+ * them independently of the laid-out geometry, so a picture of the wall must
+ * leave them to the DOM until they land. */
+export function movingNodes() { return new Set([...active.values()].map(entry => entry.node)); }
+
 export function animateLayout(previous, next, nodes, view, stage, { limit = 64, duration = 220 } = {}) {
   // captureLayoutMotion normally already cancelled them. This also prevents
   // stale effects when a caller switches to reduced motion or an empty layout.

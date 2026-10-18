@@ -1,5 +1,5 @@
 /**
- * clipwall — the spatial view.
+ * wunderkammer — the spatial view.
  *
  * The flat wall answers "show me fifty things at once and let me narrow by
  * property". This answers a different question: "which of these belong
@@ -7,7 +7,7 @@
  * filters, same adapter — a second reading of one corpus, not a second corpus.
  *
  * Everything structural lives in the vendored muriel lib (see lib/VENDOR.md).
- * What is here is clipwall's own: mapping clips onto the field, turning facets
+ * What is here is wunderkammer's own: mapping clips onto the field, turning facets
  * into piles, keeping the `obsidian://` deep link on every promoted card, and
  * persisting pile membership as VIEW STATE — an annotation over the corpus,
  * never a write to the notes.
@@ -20,13 +20,18 @@
 
 import { createScene, makePlane, THREE }
   from './lib/spatial.js';
+import { remote } from '../media-policy.mjs';
 import { TileField } from './lib/instanced.js';
 import { HybridField } from './lib/hybrid.js';
 import { PileLayout } from './lib/piles.js';
 import { FieldNavigator } from './lib/navigate.js';
 import { CardHost, supported as drawableSupported } from './lib/cards.js';
+import { RETRY } from './lib/atlas.js';
+import { spriteCovers } from '../sprite-covers.mjs';
 import { RowMotion } from './lib/motion.js';
-import { groupBy, layout } from '../layout.mjs';
+import { groupBy, layout, SIMILARITY, isSimilarity } from '../layout.mjs';
+import { spreadScale, HOVER_PX } from '../similarity-layout.mjs';
+import { perf } from '../instrument.mjs';
 
 
 
@@ -57,7 +62,7 @@ function aspectOfClip(clip) {
 export const keyOfClip = (clip) => clip.url || `id:${clip.id}`;
 
 /**
- * Route remote images through clipwall's own origin.
+ * Route remote images through wunderkammer's own origin.
  *
  * A texture atlas is a canvas, so a cross-origin image needs the publisher to
  * send CORS headers — the loader has to request crossOrigin="anonymous", and
@@ -69,12 +74,12 @@ export const keyOfClip = (clip) => clip.url || `id:${clip.id}`;
  *
  * Vault media is already same-origin and is left alone.
  */
-function proxied(src) {
+export function proxied(src) {
   // Same-origin media needs no proxy: root-relative (the server) or relative
   // (the static demo, served from a sub-path). Only absolute remote URLs go through it.
   if (!/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith('//')) return src;
   if (new URL(src, location.href).origin === location.origin) return src;
-  return `/api/proxy?url=${encodeURIComponent(src)}`;
+  return remote(src);
 }
 
 /**
@@ -83,7 +88,7 @@ function proxied(src) {
  * far tier's 64 px slot takes a 128 px derivative and the near tier's 256 px
  * slot a 640 px one, instead of both downscaling the same file.
  */
-function sourceFor(clip, px) {
+export function sourceFor(clip, px) {
   const variants = (Array.isArray(clip?.coverVariants) ? clip.coverVariants : [])
     .filter(v => typeof v?.src === 'string' && Number.isFinite(v.width) && v.width > 0)
     .sort((a, b) => a.width - b.width);
@@ -172,6 +177,9 @@ export class SpatialView {
     this.surface = { planeToWorld: (u, v, h) => new THREE.Vector3(u, v + h / 2, 0) };
     this.basePos = new THREE.Vector3(0, 0, 1600);
     this.lookTarget = new THREE.Vector3();
+    // An initially empty scope has no corners for fit(), but still has a valid
+    // automatic camera state to save and restore through a view link.
+    this.fitted = true;
     this.motion = new RowMotion({ speed: 0, wrapSpan: 0, sweep: 0 });
     this.motion.setEnabled(false);
     this._replaceField();
@@ -240,25 +248,31 @@ export class SpatialView {
           this.camera.position.copy(this.basePos);
           this.camera.lookAt(this.lookTarget);
           this.camera.updateMatrixWorld();
+          this._applySpread();
           // Spend the near atlas on exposed covers / the open stack before
           // hidden members. Otherwise late-month covers get stuck at 64px.
           const readable = this.mode === 'piles'
             ? (this.piles.spreadPile >= 0 ? this.piles.piles[this.piles.spreadPile].indices
               : this.piles.piles.flatMap((_, i) => this.piles.faceOf(i))) : [];
           for (const i of readable) this.field.atlases.request(i, 'near', now);
+          const endPass = perf.begin('spatial/pass');
           this.field.update(this.camera, now);
           this.hybrid.update(this.camera);
           this.hybrid.sort(this.camera);
+          endPass();
           // Keep group names readable and steady at every zoom level.
           const focal = h / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)));
           for (const label of this.labelObjs) label.scale.setScalar(
             (this.camera.position.z - label.position.z) / focal * 0.55);
           this.field.takeDirty();
           this._render();
-        } else if (this.field.flush(now) || this.field.takeDirty()) {
+        } else {
           // Nothing moved, but a tile landed (or the lib changed an attribute):
-          // draw the new pixels, skip the passes.
-          this._render();
+          // draw the new pixels, skip the passes. Both calls run every frame:
+          // an upload also marks the field dirty, and with `flush() || takeDirty()`
+          // that mark survived to the next frame and drew the same pixels again.
+          const uploaded = this.field.flush(now), changed = this.field.takeDirty();
+          if (uploaded || changed) this._render();
         }
       }
       requestAnimationFrame(frame);
@@ -274,9 +288,42 @@ export class SpatialView {
   }
 
   _render() {
+    const done = perf.begin('spatial/render');
     this.webglRenderer.render(this.scene, this.camera);
     this.cssRenderer.render(this.scene, this.camera);
+    done();
     this.renders = (this.renders || 0) + 1;   // for the perf harness: idle must not count
+  }
+
+  /**
+   * Perf probe only (off unless ?perf): count atlas tile draws and the bytes
+   * each flush sends to the GPU, and expose residency as a gauge. Wraps the
+   * vendored lib's instances rather than editing lib/, which is a copy.
+   */
+  _instrumentField() {
+    for (const [tier, atlas] of [['far', this.field.atlases.far], ['near', this.field.atlases.near]]) {
+      const draw = atlas.draw.bind(atlas), flush = atlas.flush.bind(atlas);
+      atlas.draw = (slot, image) => { const ok = draw(slot, image); if (ok) perf.count(`spatial/draws.${tier}`); return ok; };
+      atlas.flush = (t) => {
+        const done = perf.begin(`spatial/upload.${tier}`);
+        const ok = flush(t); done();
+        if (ok) { perf.count(`spatial/uploads.${tier}`); perf.count(`spatial/uploadMB.${tier}`, (atlas.uploadedBytes ?? atlas.bytes) / 1048576); }
+        return ok;
+      };
+    }
+    perf.provide('spatial', () => {
+      if (!this.field || this.host.hidden) return { open: false };
+      const a = this.field.atlases; let far = 0, near = 0, resident = 0;
+      for (let i = 0; i < this.field.count; i++) {
+        const f = a.farSlot[i] >= 0, n = a.nearSlot[i] >= 0;
+        if (f) far++; if (n) near++; if (f || n) resident++;
+      }
+      const info = this.webglRenderer.info;
+      return { open: true, count: this.field.count, resident, far, near, failed: a._failed?.size ?? 0,
+        inflight: a._inflight ?? 0, queued: (a._farQueue?.length ?? 0) + (a._nearQueue?.length ?? 0),
+        domCards: this.hybrid.live.size, renders: this.renders || 0, atlasMB: Math.round(this.field.bytes / 1048576),
+        drawCalls: info.render.calls, textures: info.memory.textures };
+    });
   }
 
   /** Something outside the lib's knowledge changed what the frame shows. */
@@ -301,6 +348,8 @@ export class SpatialView {
     this._unsubscribePaint = null;
 
     const clips = this.clips;
+    // Both tiers ask for many covers at once; have their sheets decoding first.
+    if (spriteCovers.available) { spriteCovers.warm(64); spriteCovers.warm(160); }
 
     // Drawable cards: source near-tier tiles from live DOM instead of images,
     // so a tile keeps its text in find-in-page and Cmd+F can move the camera.
@@ -350,9 +399,21 @@ export class SpatialView {
       // `_capturing` brackets our own drawElementImage calls: a capture
       // repaints the card, and a repaint is indistinguishable from a find at
       // the event level.
-      resolveSource: this.cardHost
+      // A cover kept as sprite-sheet cells has no URL for the image path: both
+      // tiers draw its cell straight from the decoded sheet, and RETRY waits
+      // the frames a page takes to arrive (sprite-covers.mjs). The near tier
+      // asks for 160 px, not its 256 px slot: the 256 nearest covers span most
+      // of a collection's full-size level (~45 Mpx for the Psychodeli example,
+      // over the decode budget, so pages evicted each other and tiles ran out
+      // of retries), and the closest ones become DOM cards with the full cell.
+      resolveSource: this.cardHost || spriteCovers.available
         ? (i, tier) => {
-          if (tier !== 'near' || this.host.hidden) return null;
+          if (spriteCovers.has(clips[i])) {
+            // No cell (its page failed): null takes the image path to the clip's file.
+            const need = tier === 'near' ? 160 : 64;
+            return spriteCovers.serves(clips[i], need) ? spriteCovers.source(clips[i], need) ?? RETRY : null;
+          }
+          if (!this.cardHost || tier !== 'near' || this.host.hidden) return null;
           this._capturing = true;
           try { return this.cardHost?.capture(i) ?? null; }
           finally { queueMicrotask(() => { this._capturing = false; }); }
@@ -378,6 +439,7 @@ export class SpatialView {
       onActivate: (i) => this._activate(i),
     });
     this._bindCardHover();
+    if (perf.enabled) this._instrumentField();
     { const setFocus = this.hybrid.setFocus.bind(this.hybrid); this.hybrid.setFocus = (i) => { setFocus(i); this.invalidate(); }; }
     if (this.nav) {
       this.nav.field = this.field;
@@ -425,14 +487,20 @@ export class SpatialView {
     const clip = this.clips[i];
     if (!clip) return;
 
+    const sprite = spriteCovers.has(clip);
     const src = sourceFor(clip, 340) || '';   // the card is authored 340 px wide
-    if (src) {
+    if (src || sprite) {
       const img = document.createElement('img');
       img.className = 'sp-thumb';
       // The DOM pool renders a plain <img> and is fine cross-origin. A drawable
       // is not: cross-origin content inside one is dropped from the snapshot,
       // leaving the hero blank while the rest of the card draws.
-      img.src = proxyHero ? proxied(src) : src;
+      const file = src && (proxyHero ? proxied(src) : src);
+      if (sprite) {
+        // A pooled card can be rebuilt for another item before the cell
+        // arrives; only an <img> still in its card takes it.
+        void spriteCovers.coverUrl(clip, 340 * Math.min(2, window.devicePixelRatio || 1), file).then(url => { if (url && img.parentNode === el) img.src = url; });
+      } else img.src = file;
       img.alt = '';
       img.draggable = false;
       img.addEventListener('error', () => el.classList.add('broken'), { once: true });
@@ -526,7 +594,7 @@ export class SpatialView {
       this._hoverTimer = 0; this._hoverCandidate = -1;
       if (!this.hoverEnabled() || this._cameraMotion) return;
       const clip = this._hoverTarget(index);
-      if (clip) { this._hovered = index; this.onHover(clip); }
+      if (clip) { this._hovered = index; this.onHover(clip); if (this._applySpread(true)) this.invalidate(); }
     }, 120);
   }
 
@@ -540,6 +608,7 @@ export class SpatialView {
     if (this._hoverFrame) { cancelAnimationFrame(this._hoverFrame); this._hoverFrame = 0; }
     if (this._hovered === -1) return;
     this._hovered = -1;
+    if (this._applySpread(true)) this.invalidate();
     this.onHoverEnd();
   }
 
@@ -641,18 +710,47 @@ export class SpatialView {
   }
 
   _composition(clips, gap = 14) {
-    return layout(clips, 'none', { viewportAspect: this.camera.aspect, gap });
+    // The similarity map and grid keep the flat wall's places (same corpus,
+    // same projection); every other key lays the field out as justified rows.
+    const key = isSimilarity(this.groupKey) ? this.groupKey : 'none';
+    return layout(clips, key, { viewportAspect: this.camera.aspect, gap, universe: this.clips });
   }
 
   _placeField() {
     const active = this.active || [];
     const result = this._composition(active.map(i => this.clips[i]));
+    // The similarity map spreads on zoom: keep each tile's base place so the
+    // frame loop can resize it around its centre (_applySpread).
+    this._spreadBase = this.groupKey === SIMILARITY ? new Map() : null;
     result.tiles.forEach((t, k) => {
       const i = active[k];
       this.field.place(i, t.x + t.w / 2, -t.y - t.h / 2, 0, t.w, t.h);
       this.field.setRow(i, 0);
+      this._spreadBase?.set(i, { x: t.x + t.w / 2, y: -t.y - t.h / 2, w: t.w, h: t.h });
     });
+    this._spreadZ = NaN;
     this.field.layout();
+  }
+
+  /**
+   * Hold every similarity-map tile inside SPREAD_BAND screen pixels for the
+   * current camera distance; the hovered tile alone grows to HOVER_PX and
+   * steps forward. Writes instance sizes only when the distance changed by
+   * more than 0.2% (or `force`), so a settled camera costs nothing.
+   */
+  _applySpread(force = false) {
+    if (!this._spreadBase || this.mode !== 'mountain') return false;
+    const z = Math.max(1, this.basePos.z), h = this.host.clientHeight || 1;
+    if (!force && Math.abs(z - this._spreadZ) / z < 0.002) return false;
+    this._spreadZ = z;
+    const focal = h / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)));
+    for (const [i, b] of this._spreadBase) {
+      const natural = Math.max(b.w, b.h) * focal / z;
+      const k = i === this._hovered ? Math.max(HOVER_PX, natural) / natural : spreadScale(natural);
+      this.field.place(i, b.x, b.y, i === this._hovered ? 1 : 0, b.w * k, b.h * k);
+    }
+    this.field.layout();
+    return true;
   }
 
   _spread(index, { animate = false } = {}) {
@@ -806,6 +904,9 @@ export class SpatialView {
     let z = 150;
     for (const p of corners) z = Math.max(z, p.z + Math.abs(p.x - centre.x) / (tan * this.camera.aspect * fx),
       p.z + Math.abs(p.y - centre.y) / (tan * fy));
+    // A sparse arrangement (the similarity map) fits from further away than the
+    // scene's default far plane; past it the whole field is clipped to black.
+    if (z * 1.25 > this.camera.far) { this.camera.far = z * 1.5; this.camera.updateProjectionMatrix(); }
     this._moveCamera({ position: [centre.x, centre.y, z], target: [centre.x, centre.y, 0], fitted: true }, { animate });
   }
 
@@ -967,7 +1068,9 @@ export class SpatialView {
     return groups.length;
   }
 
-  showMountain() {
+  showMountain(arrangement = this.groupKey) {
+    // The field's arrangement: 'none' (justified rows) or the similarity map.
+    this.groupKey = arrangement;
     this._show();
   }
 
