@@ -2,10 +2,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { AlbumWalls } from './album-walls.mjs';
+import { listenSideScroll } from './aisle-wheel.mjs';
 import { groupBy } from './layout.mjs';
 import { clipKey, matchesFacet } from './context-clusters.mjs';
 import { sortClips, attributeMark } from './attributes.mjs';
-import { NEUTRAL_NOUNS, counted } from './nouns.mjs';
+import { NEUTRAL_NOUNS, wallLabel } from './nouns.mjs';
 
 const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
 const vector = value => Array.isArray(value) && value.length === 3 && value.every(n => Number.isFinite(n) && Math.abs(n) <= 1e6);
@@ -30,19 +31,22 @@ export class AisleView {
     this.itemSelect = element('select'); this.itemSelect.setAttribute('aria-label', 'Choose an item in this scope'); selectLabel.append(this.itemSelect);
     this.inspectButton = element('button', '', 'Inspect'); this.inspectButton.type = 'button'; this.inspectButton.disabled = true;
     this.toolbar.append(travelLabel, selectLabel, this.inspectButton);
-    this.help = element('p', 'aisle-help', 'Drag to look · Scroll to zoom · Arrow keys turn · Home returns to entrance');
+    this.help = element('p', 'aisle-help', 'Drag to look · Scroll to zoom, sideways to walk · Arrows turn · Home: entrance');
     try {
       this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
       this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2)); this.renderer.outputColorSpace = THREE.SRGBColorSpace;
       this.canvas = this.renderer.domElement; this.canvas.className = 'aisle-canvas'; this.canvas.tabIndex = 0;
-      this.canvas.setAttribute('role', 'img'); this.canvas.setAttribute('aria-label', 'Artwork aisle. Drag or use arrow keys to turn, plus and minus to zoom, Home for entrance. Tab to choose and inspect any item.');
+      this.canvas.setAttribute('role', 'img'); this.canvas.setAttribute('aria-label', 'Artwork aisle. Drag or use arrow keys to turn, plus and minus to zoom, scroll sideways to walk, Home for entrance. Tab to choose and inspect any item.');
       this.host.append(this.canvas);
+      // Sideways scroll is a walk along the aisle; vertical scroll stays OrbitControls' zoom.
+      this.unlistenWheel = listenSideScroll(this.canvas, { walk: distance => this.walk(distance) });
       this.controls = new OrbitControls(this.camera, this.canvas); this.controls.enableDamping = false;
       this.controls.enablePan = false; this.controls.minDistance = .5; this.controls.maxDistance = 80;
       this.controls.minPolarAngle = .15; this.controls.maxPolarAngle = Math.PI * .9;
       this.controls.rotateSpeed = .55; this.controls.zoomSpeed = .65;
       this.controls.addEventListener('change', () => { this.invalidate(); if (!this.programmatic) { this.fitted = false; this.cancelHover(); this.interact(); } });
-      this.art = new AlbumWalls(this.root, () => this.invalidate(), { onProgress: () => this.updateStatus() });
+      // The nouns arrive with setClips, after this; the label reads them when each rack is built.
+      this.art = new AlbumWalls(this.root, () => this.invalidate(), { onProgress: () => this.updateStatus(), wallLabel: (label, count) => wallLabel(label, count, this.nouns) });
       this.raycaster = new THREE.Raycaster();
       this.listen(this.canvas, 'pointerdown', e => { this.cancelHover(); this.down = e.isPrimary ? { id: e.pointerId, x: e.clientX, y: e.clientY } : null; });
       this.listen(this.canvas, 'pointerup', e => {
@@ -96,7 +100,7 @@ export class AisleView {
     this.itemSelect.replaceChildren(new Option('Choose an item…', ''));
     const used = new Set();
     for (const group of this.cohorts) {
-      const optgroup = element('optgroup'); optgroup.label = `${group.label} · ${counted(group.count, this.nouns)}`;
+      const optgroup = element('optgroup'); optgroup.label = wallLabel(group.label, group.count, this.nouns);
       for (const key of group.keys) if (!used.has(key)) { used.add(key); optgroup.append(new Option(this.clipsByKey.get(key).title || key, key)); }
       if (optgroup.children.length) this.itemSelect.append(optgroup);
     }
@@ -120,7 +124,7 @@ export class AisleView {
     for (const { anchor, node } of this.labels) {
       const group = this.cohorts.find(group => group.key === anchor.cohort);
       const matched = group.keys.filter(key => marks.get(key)?.match).length;
-      node.textContent = exact ? `${group.label} · ${matched} / ${group.count} match` : `${group.label} · ${counted(group.count, this.nouns)}`;
+      node.textContent = exact ? `${group.label} · ${matched} / ${group.count} match` : anchor.text;
       node.title = node.textContent;
     }
     this.invalidate();
@@ -156,6 +160,24 @@ export class AisleView {
   }
   setCamera(position, target) {
     this.programmatic = true; this.camera.position.fromArray(position); this.controls?.target.fromArray(target); this.controls?.update(); this.camera.position.fromArray(position); this.camera.lookAt(new THREE.Vector3().fromArray(target)); this.camera.updateMatrixWorld(true); this.programmatic = false; this.invalidate();
+  }
+  /** Walk `distance` world units deeper (negative: back toward the entrance).
+   * Travel moves as the slider moves it, but the camera keeps its angle to the
+   * walls: a fitted view takes the pose at the new travel, a turned or zoomed
+   * one slides along the aisle with its target. */
+  walk(distance) {
+    if (!this.art || !this.controls || !this.clipsByKey.size || !Number.isFinite(distance)) return false;
+    const { length } = this.art.travelSpan(), from = this.travel;
+    if (!(length > 0)) return false;
+    const travel = Math.round(clamp(from + distance / length, 0, 1) * 1e5) / 1e5;
+    if (travel === from) return false;
+    this.travel = travel; this.slider.value = String(travel);
+    if (this.fitted) this.applyPose();
+    else {
+      const step = new THREE.Vector3(0, 0, (from - travel) * length);
+      this.setCamera(this.camera.position.clone().add(step).toArray(), this.controls.target.clone().add(step).toArray());
+    }
+    this.cancelHover(); this.interact(); return true;
   }
   fitView() { this.travel = 0; this.slider.value = '0'; this.fitted = true; this.applyPose(); this.cancelHover(); this.interact(); }
   zoomBy(factor) {
@@ -221,7 +243,7 @@ export class AisleView {
     labels: this.labels.map(({node}) => node.textContent), selection: this.selection, graphicsError: this.graphicsError || null }; }
   dispose() {
     if (this.disposed) return; this.disposed = true; this.cancelHover(); if (this.frame) cancelAnimationFrame(this.frame);
-    this.resizeObserver?.disconnect(); for (const [node, name, fn] of this.listeners) node.removeEventListener(name, fn);
+    this.resizeObserver?.disconnect(); this.unlistenWheel?.(); for (const [node, name, fn] of this.listeners) node.removeEventListener(name, fn);
     this.controls?.dispose(); this.art?.dispose(); this.renderer?.dispose(); this.renderer?.forceContextLoss(); this.host.replaceChildren();
   }
 }
