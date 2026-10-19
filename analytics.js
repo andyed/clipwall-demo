@@ -30,7 +30,7 @@
 const POSTHOG_KEY = 'phc_yuvWuYwKci8a2kK5kHecbqkFKun7tBJ5Qv25ghWBu8Ag';
 const POSTHOG_HOST = 'https://us.i.posthog.com';
 /** build-demo.mjs replaces this with `git describe` at build time. */
-const APP_VERSION = "v0.2.0-19-g2b3ae42";
+const APP_VERSION = "v0.2.0-25-gb16bbd8";
 
 export const DEMO_HOST = 'andyed.github.io';
 /** Backstop against a looping caller, per page load. A visitor cannot reach it; a bug can. */
