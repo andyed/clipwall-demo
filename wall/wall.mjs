@@ -591,6 +591,11 @@ function viewNotes() {
       const order = state.float.describeFront();
       view = `Cloud${lead || order ? ': ' : ''}${[lead, order && (lead ? `each ${order}` : order)].filter(Boolean).join('; ')}`;
       name = 'Cloud';
+    } else if (arrangement === 'sphere') {
+      const { facing, cap } = state.float.sphereOptions();
+      const shape = facing === 'in' ? `facing in${cap ? `, open ${cap}°` : ''}` : cap ? `open ${cap}°` : '';
+      view = `Sphere${shape ? ` (${shape})` : ''}: lightest at the top, darkest at the bottom, hue around`;
+      brief = 'Sphere: lightness up, hue around'; name = 'Sphere';
     }
     else { view = `Placed by dominant colour in ${ARRANGEMENT_LABELS[arrangement]}`; name = ARRANGEMENT_LABELS[arrangement]; }
   } else if (state.mode === 'flat') {
@@ -2159,7 +2164,15 @@ function renderDetail(clip) {
   // detailCover file still wins.
   const sprite = !clip.detailCover && spriteCovers.has(clip);
   const cover = clip.detailCover || clip.cover || clip.media?.[0]?.src;
-  if (cover || sprite) {
+  if (clip.video) {
+    // A video item plays here, muted and looping as on its tile, with controls
+    // for sound and scrubbing; its cover is the poster until the first frame.
+    const video = document.createElement('video');
+    video.muted = true; video.loop = true; video.autoplay = true; video.playsInline = true; video.controls = true;
+    if (cover) video.poster = cover;
+    video.src = clip.video;
+    d.append(video);
+  } else if (cover || sprite) {
     const img = document.createElement('img');
     img.alt = '';
     img.decoding = 'async';
